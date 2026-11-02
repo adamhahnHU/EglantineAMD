@@ -191,7 +191,9 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
             if (!queue.TryPop(playing_buffer)) {
                 lk.unlock();
                 for (size_t i = frames_written; i < num_frames; i++)
-                    std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
+                    std::memset(&output_buffer[i * frame_size], 0, frame_size_bytes);
+                LOG_WARNING(Audio, "Audio output underrun: {} of {} frames silent",
+                            num_frames - frames_written, num_frames);
                 frames_written = num_frames;
                 continue;
             }
