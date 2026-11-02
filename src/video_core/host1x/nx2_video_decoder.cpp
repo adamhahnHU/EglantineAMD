@@ -223,6 +223,30 @@ void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format,
     if (width == 0 || height == 0 || out.size() < needed) {
         return;
     }
+    if (format == Nx2PictureFormat::Nv12 && f->format == AV_PIX_FMT_NV12 &&
+        f->width == static_cast<int>(width) && f->height == static_cast<int>(height) &&
+        f->data[0] != nullptr && f->data[1] != nullptr) {
+        const u32 luma_rows = height;
+        const u32 chroma_rows = (height + 1) / 2;
+        if (f->linesize[0] == static_cast<int>(pitch)) {
+            std::memcpy(out.data(), f->data[0], u64{luma_rows} * pitch);
+        } else {
+            for (u32 y = 0; y < luma_rows; ++y) {
+                std::memcpy(out.data() + u64{y} * pitch, f->data[0] + u64{y} * f->linesize[0],
+                            width);
+            }
+        }
+        u8* chroma_out = out.data() + chroma_offset;
+        if (f->linesize[1] == static_cast<int>(pitch)) {
+            std::memcpy(chroma_out, f->data[1], u64{chroma_rows} * pitch);
+        } else {
+            for (u32 y = 0; y < chroma_rows; ++y) {
+                std::memcpy(chroma_out + u64{y} * pitch, f->data[1] + u64{y} * f->linesize[1],
+                            width);
+            }
+        }
+        return;
+    }
     const AVPixelFormat target = format == Nx2PictureFormat::Nv12    ? AV_PIX_FMT_NV12
                                  : format == Nx2PictureFormat::Rgba8 ? AV_PIX_FMT_RGBA
                                                                      : AV_PIX_FMT_BGRA;
