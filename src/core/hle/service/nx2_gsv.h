@@ -2700,6 +2700,7 @@ private:
     // images, in order.
     void DecodeLoop() {
         Common::SetCurrentThreadName("nx2:vdec");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
         std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder> decoder;
         std::vector<Tegra::Host1x::Nx2Picture> pictures;
         std::vector<u8> bytes;
