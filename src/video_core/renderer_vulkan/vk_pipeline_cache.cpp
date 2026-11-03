@@ -1027,6 +1027,14 @@ void PipelineCache::EvictUnusedPipelines() {
     if (frame_count <= EvictAfterFrames) {
         return;
     }
+    // Cards of 16 GB and more keep up to 5,000 (~2.2 GB): evicted, title 1's menu and results
+    // pipelines were built again after every race, and asynchronous shaders skip their draws
+    // until then (missing UI elements, hitches on every return to a menu).
+    constexpr size_t KeepOnLargeCards = 5000;
+    if (device.GetDeviceLocalMemory() >= (u64{16} << 30) &&
+        graphics_cache.size() <= KeepOnLargeCards) {
+        return;
+    }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
     size_t evicted = 0;
