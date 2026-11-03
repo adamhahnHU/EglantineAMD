@@ -1818,8 +1818,13 @@ private:
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
         }();
-        const u32 swap_interval =
-            forced_interval != 0 ? forced_interval : std::clamp<u32>(timing >> 16, 1, 4);
+        // With MKW's dynamic frame rate the game times its own frames to pick 1 or 2 vblanks:
+        // holding a frame for 2 would make every frame last 2 and keep it at 30 fps for good, so
+        // pace to each vblank and let the game catch up through its interval.
+        const u32 swap_interval = forced_interval != 0 ? forced_interval
+                                  : Settings::values.mkw_dynamic_fps.GetValue()
+                                      ? 1U
+                                      : std::clamp<u32>(timing >> 16, 1, 4);
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
         if (timing != std::exchange(m_swap_word, timing)) {
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
