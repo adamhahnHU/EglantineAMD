@@ -186,6 +186,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Uploads the image's dirty layers. False when it needs a full upload instead.
     bool UploadWrittenLayers(Image& image);
 
+    /// First upload of a backed image over gigabytes of Switch 2 sparse memory: uploads only
+    /// the layers the game has written, a few at a time. Returns false to upload it whole.
+    bool UploadWrittenSparseLayers(Image& image);
+
     /// Gives the written layers of a SparseLayers image memory and uploads them.
     void RefreshSparseLayers(Image& image);
 

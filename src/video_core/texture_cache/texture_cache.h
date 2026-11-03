@@ -251,7 +251,12 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
     // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
     // MaxCriticalMemory on rather than near the card's budget.
-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
+    // Cards with plenty of memory (24 GB) keep half of it, so they don't re-decode evicted ASTC.
+    u64 max_critical = MaxCriticalMemory;
+    if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        max_critical = (std::max)(max_critical, runtime.GetDeviceLocalMemory() / 2);
+    }
+    critical_memory = (std::min)(critical_memory, max_critical);
     expected_memory =
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
@@ -1584,6 +1589,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         runtime.InsertUploadMemoryBarrier();
         return;
     }
+    if (image.dirty_layers.empty() && UploadWrittenSparseLayers(image)) {
+        runtime.InsertUploadMemoryBarrier();
+        return;
+    }
     image.dirty_layers.clear();
 
     if (True(image.flags & ImageFlagBits::Unbacked)) {
@@ -1765,6 +1774,39 @@ bool TextureCache<P>::UploadWrittenLayers(Image& image) {
             return false;
         }
         UploadLayers(image, layers);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+template <class P>
+bool TextureCache<P>::UploadWrittenSparseLayers(Image& image) {
+    if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
+        // Staging all of title 1's 8192x8192x68 BC6H terrain array at once would take ~6 GB.
+        constexpr u64 MinSize = u64{1} << 30;
+        constexpr size_t LayersPerUpload = 4;
+        const u32 num_layers = static_cast<u32>(image.info.resources.layers);
+        const u64 stride = image.info.layer_stride;
+        const u64 size = stride * num_layers;
+        if (True(image.flags & ImageFlagBits::Unbacked) || num_layers <= 1 || size < MinSize ||
+            !Tegra::Nx2InSparseRegion(image.gpu_addr, size)) {
+            return false;
+        }
+        std::vector<u32> layers;
+        for (u32 layer = 0; layer < num_layers; ++layer) {
+            if (!Tegra::Nx2SparseUnwritten(image.gpu_addr + layer * stride, stride)) {
+                layers.push_back(layer);
+            }
+        }
+        if (layers.empty()) {
+            runtime.TransitionImageLayout(image);
+            return true;
+        }
+        for (size_t first = 0; first < layers.size(); first += LayersPerUpload) {
+            const size_t count = (std::min)(LayersPerUpload, layers.size() - first);
+            UploadLayers(image, std::span<const u32>{layers}.subspan(first, count));
+        }
         return true;
     } else {
         return false;
