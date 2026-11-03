@@ -26,7 +26,8 @@ concurrency:
 
 jobs:
   # latest: this branch. build131: upstream build 131 (ce1b1de), whose textures render correctly
-  # on AMD, with this branch's memory fixes applied as a patch.
+  # on AMD, with .github/patches/build131-mkw-amd.patch applied (later performance commits that
+  # don't touch textures, the memory fixes and dynamic FPS).
   build:
     name: windows-x86_64-zen4 ${{ matrix.variant }}
     runs-on: windows-2022
@@ -193,7 +194,7 @@ jobs:
           Mario Kart World build for a Ryzen 7000 (Zen 4) CPU and an AMD Radeon GPU, from ${GITHUB_SHA}.
 
           - \`latest\`: this branch, with the newest upstream changes.
-          - \`build131\`: upstream build 131 (ce1b1de) with this branch's VRAM and texture cache fixes.
+          - \`build131\`: upstream build 131 (ce1b1de) plus the later upstream performance commits that don't touch textures, the VRAM and texture cache fixes, and dynamic FPS.
 
           Extract a zip and run \`eglantine.exe\`. Built with MinGW clang, Eden's PGO profile and
           \`-march=znver4\`: it needs a CPU with AVX-512 (Ryzen 7000/9000) and will not start on older ones.

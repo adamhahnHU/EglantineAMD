@@ -1,5 +1,2445 @@
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 74e2006d15..614bc44dca 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -605,6 +605,13 @@ struct Values {
+     SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
+                                                 Category::RendererAdvanced};
+ 
++    // Mario Kart World: keep the game in its own 30 fps mode (loader/nso.cpp).
++    SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
++    // Mario Kart World: the game's own dynamic frame rate, timed on the whole frame (nso.cpp),
++    // with presents paced to every vblank (nx2_gsv.h). Takes precedence over mkw_30fps.
++    SwitchableSetting<bool> mkw_dynamic_fps{linkage, true, "mkw_dynamic_fps",
++                                            Category::RendererAdvanced};
++
+     SwitchableSetting<bool> use_reactive_flushing{linkage,
+ #ifdef __ANDROID__
+                                                   false,
+diff --git a/src/common/slot_vector.h b/src/common/slot_vector.h
+index f6da7a59d1..8e1c06e35a 100644
+--- a/src/common/slot_vector.h
++++ b/src/common/slot_vector.h
+@@ -52,12 +52,16 @@ public:
+             const u64* const bitset = slot_vector->stored_bitset.data();
+             const u32 size = static_cast<u32>(slot_vector->stored_bitset.size()) * 64;
+             if (id.Value() < size) {
+-                do {
+-                    ++id.index;
+-                } while (id.Value() < size && !IsValid(bitset));
+-                if (id.Value() == size) {
+-                    id = SlotId{};
++                u32 index = id.Value() + 1;
++                while (index < size) {
++                    const u64 word = bitset[index / 64] >> (index % 64);
++                    if (word != 0) {
++                        index += static_cast<u32>(std::countr_zero(word));
++                        break;
++                    }
++                    index = (index / 64 + 1) * 64;
+                 }
++                id = index < size ? SlotId{index} : SlotId{};
+             }
+             return *this;
+         }
+@@ -139,7 +143,7 @@ public:
+         if (it == stored_bitset.end()) {
+             return end();
+         }
+-        const u32 word_index = static_cast<u32>(std::distance(it, stored_bitset.begin()));
++        const u32 word_index = static_cast<u32>(std::distance(stored_bitset.begin(), it));
+         const SlotId first_id{word_index * 64 + static_cast<u32>(std::countr_zero(*it))};
+         return Iterator(this, first_id);
+     }
+diff --git a/src/core/hle/kernel/k_priority_queue.h b/src/core/hle/kernel/k_priority_queue.h
+index 89a0c5bbea..5d93455d33 100644
+--- a/src/core/hle/kernel/k_priority_queue.h
++++ b/src/core/hle/kernel/k_priority_queue.h
+@@ -11,6 +11,7 @@
+ #include <bitset>
+ #include <concepts>
+ #include <cstddef>
++#include <type_traits>
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
+@@ -196,12 +197,7 @@ public:
+         constexpr Member* GetFront(s32 core) const {
+             ASSERT(IsValidCore(core));
+ 
+-            const s32 priority = s32([](auto const& e) {
+-                for (size_t i = 0; i < e.size(); ++i)
+-                    if (e[i])
+-                        return i;
+-                return e.size();
+-            }(m_available_priorities[core]));
++            const s32 priority = s32(GetNextSet(m_available_priorities[core], size_t(-1)));
+             if (priority <= LowestPriority) {
+                 return m_queues[priority].GetFront(core);
+             } else {
+@@ -222,7 +218,17 @@ public:
+ 
+         template<size_t N>
+         constexpr size_t GetNextSet(std::bitset<N> const& bit, size_t n) const {
+-            for (size_t i = n + 1; i < bit.size(); i++)
++            const size_t first = n + 1;
++            if (first >= bit.size()) {
++                return bit.size();
++            }
++            if constexpr (N <= 64) {
++                if (!std::is_constant_evaluated()) {
++                    const u64 remaining = bit.to_ullong() >> first;
++                    return remaining != 0 ? first + size_t(std::countr_zero(remaining)) : bit.size();
++                }
++            }
++            for (size_t i = first; i < bit.size(); i++)
+                 if (bit[i])
+                     return i;
+             return bit.size();
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp b/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
+index 40313a10fb..304b341392 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
++++ b/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
+@@ -176,7 +176,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
+     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
+     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
+     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
+-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
++    system.GPU().MapInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
+         gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+     });
+     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
+@@ -253,7 +253,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
+     }
+     nx2_sparse_ranges[gpu_address] = {size, device_address};
+     // On the GPU thread, as in Nx2Map.
+-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
++    system.GPU().MapInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
+         gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+     });
+     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
+@@ -295,7 +295,7 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
+     // whose contents are now what the game's memory holds there.
+     const DAddr device = device_address + (gpu_address - start);
+     auto& smmu = system.Host1x().MemoryManager();
+-    system.GPU().RunInOrder([&smmu, device, cpu_address, size, asid = session->asid] {
++    system.GPU().MapInOrder([&smmu, device, cpu_address, size, asid = session->asid] {
+         smmu.Unmap(device, size);
+         if (cpu_address != 0) {
+             smmu.Map(device, cpu_address, size, asid, true);
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp b/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+index 848c15d6f8..79586446d5 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
++++ b/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+@@ -445,7 +445,10 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
+             const char* value = std::getenv("EDEN_NX2_PB_SNAPSHOT");
+             return value == nullptr || value[0] != '0';
+         }();
+-        if (snapshot && channel_state->memory_manager) {
++        if (snapshot && channel_state->memory_manager && channel_state->payload) {
++            // Before the copy: a suspension during it must count as one after it.
++            entries.snapshot_suspensions =
++                channel_state->payload->dma_pusher.suspensions.load(std::memory_order_acquire);
+             size_t words = 0;
+             for (const auto& entry : entries.command_lists) {
+                 words += entry.size;
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index 37c797fa3f..c23bfbba4e 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -1705,37 +1705,41 @@ private:
+             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
+                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
+         }
+-        // Wait for the previous frame's fence instead of this one, so the game prepares frame N+1
+-        // while the GPU thread runs frame N (the console keeps several frames in flight). Waiting
+-        // for this frame serialized the two: 8-56 ms of every 34-105 ms frame on title 1.
+-        // EDEN_NX2_FRAMES_AHEAD=0 restores the wait for the current frame.
+-        static const bool frames_ahead = [] {
++        // Wait for this frame's fence, so the game doesn't write the next frame's data (constant
++        // buffers holding texture handles, vertex data, Pokopia's glyph atlas) while the GPU
++        // thread still reads this frame's. But title 1's GPU waits on semaphores its CPU releases
++        // only after this present returns: while a channel stays suspended on one, wait for the
++        // previous frame's fence instead and let the game prepare frame N+1 meanwhile (waiting
++        // for this frame there cost 8-56 ms of every 34-105 ms frame, or never finished).
++        // EDEN_NX2_FRAMES_AHEAD=1 always waits for the previous frame, =0 always for this one.
++        static const int frames_ahead = [] {
+             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
+-            return value == nullptr || value[0] != '0';
++            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+         }();
+         const auto entered = std::chrono::steady_clock::now();
+-        if (frames_ahead) {
++        if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
+             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
+                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
+                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
+-            // Only run a frame ahead while the GPU keeps up. With the previous frame still on the
+-            // GPU here, the GPU is the limit and running ahead gains nothing; and Splatoon Raiders,
+-            // which reuses its command memory as if the GPU were at most a frame behind, rewrote
+-            // command lists Eden had not read yet (misread commands, then crashes, with a slow
+-            // GPU). Wait for this frame too then.
+-            const bool gpu_behind =
+-                m_previous_fence_id < 192 &&
+-                !system.Host1x().GetSyncpointManager().IsReadyGuest(m_previous_fence_id,
+-                                                                    m_previous_fence_value);
++            // With EDEN_NX2_FRAMES_AHEAD=1, only run a frame ahead while the GPU keeps up. With
++            // the previous frame still on the GPU here, the GPU is the limit and running ahead
++            // gains nothing; and Splatoon Raiders, which reuses its command memory as if the GPU
++            // were at most a frame behind, rewrote command lists Eden had not read yet (misread
++            // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
++            // suspended channel brought us here: this frame can't finish before the present
++            // returns.
++            const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
++                                    !system.Host1x().GetSyncpointManager().IsReadyGuest(
++                                        m_previous_fence_id, m_previous_fence_value);
+             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
+             if (gpu_behind) {
+                 WaitForFrame(~w[22], w[24]);
+             }
+-            m_previous_fence_id = ~w[22];
+-            m_previous_fence_value = w[24];
+-        } else {
++        } else if (frames_ahead == 0) {
+             WaitForFrame(~w[22], w[24]);
+         }
++        m_previous_fence_id = ~w[22];
++        m_previous_fence_value = w[24];
+         const auto waited = std::chrono::steady_clock::now();
+         Composite(w[5], ~w[22], w[24], w[7]);
+         const auto composited = std::chrono::steady_clock::now();
+@@ -1808,8 +1812,13 @@ private:
+             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
+             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+         }();
+-        const u32 swap_interval =
+-            forced_interval != 0 ? forced_interval : std::clamp<u32>(timing >> 16, 1, 4);
++        // With MKW's dynamic frame rate the game times its own frames to pick 1 or 2 vblanks:
++        // holding a frame for 2 would make every frame last 2 and keep it at 30 fps for good, so
++        // pace to each vblank and let the game catch up through its interval.
++        const u32 swap_interval = forced_interval != 0 ? forced_interval
++                                  : Settings::values.mkw_dynamic_fps.GetValue()
++                                      ? 1U
++                                      : std::clamp<u32>(timing >> 16, 1, 4);
+         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+         if (timing != std::exchange(m_swap_word, timing)) {
+             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
+@@ -1832,9 +1841,12 @@ private:
+         m_next_vblank += interval;
+     }
+ 
+-    void WaitForFrame(u32 fence_id, u32 fence_value) {
++    /// Waits until the fence is reached. With `unless_gpu_waits`, gives up after a few ms once a
++    /// GPU channel was seen suspended on a semaphore (it may be one this thread releases later).
++    /// Returns whether the fence was reached.
++    bool WaitForFrame(u32 fence_id, u32 fence_value, bool unless_gpu_waits = false) {
+         if (fence_id >= 192) {
+-            return;
++            return true;
+         }
+         auto& syncpoints = system.Host1x().GetSyncpointManager();
+         const auto start = std::chrono::steady_clock::now();
+@@ -1859,11 +1871,24 @@ private:
+                 wake->cv.notify_all();
+             });
+             std::unique_lock lk{wake->mutex};
++            // Title 1's channels resume and suspend again while they wait on this thread, so any
++            // suspension counts, not only an unbroken one.
++            bool gpu_waited = false;
+             while (!wake->done && system.IsPoweredOn() &&
+                    std::chrono::steady_clock::now() < deadline) {
+-                wake->cv.wait_for(lk, std::chrono::milliseconds{50});
++                if (unless_gpu_waits) {
++                    gpu_waited |= system.GPU().HasSuspendedChannels();
++                    if (gpu_waited &&
++                        std::chrono::steady_clock::now() - start > std::chrono::milliseconds{3}) {
++                        return false;
++                    }
++                }
++                wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
+             }
+         }
++        if (unless_gpu_waits && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
++            return false;
++        }
+         if (!syncpoints.IsReadyGuest(fence_id, fence_value) && m_wait_timeouts++ < 64) {
+             LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in 4 s (now {})",
+                         m_presents, fence_id, fence_value, syncpoints.GetGuestSyncpointValue(fence_id));
+@@ -1875,6 +1900,7 @@ private:
+                          std::chrono::steady_clock::now() - start)
+                          .count());
+         }
++        return syncpoints.IsReadyGuest(fence_id, fence_value);
+     }
+ 
+     // Shows a presented native image: word 5 is the image id, ~word 22 / word 24 the GPU fence
+diff --git a/src/core/loader/nso.cpp b/src/core/loader/nso.cpp
+index 7e3b9a54c2..0a8fce7958 100644
+--- a/src/core/loader/nso.cpp
++++ b/src/core/loader/nso.cpp
+@@ -176,6 +176,75 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
+         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+     }
+ 
++    // Mario Kart World picks how many vblanks each frame lasts (its present interval) from a mode
++    // in its frame loop: 0 = from the frame time, 1 = 60 fps, 2 = 30 fps, and advances its clock by
++    // that many vblanks a frame. Forcing 2 gives a steady 30 fps at normal game speed. The mode's
++    // load is found by its code (same in 1.0.0 at 0x3A9EC8 and 1.8.0 at 0x69CC54):
++    //   cmp w9, w1; b.ne; ldr w8, [x19, #0x210]; cbnz w8; ... mov w8, #0x42700000 (60.0f)
++    //
++    // Dynamic mode (mkw_dynamic_fps) forces mode 0. The game then sets each frame's interval (1 or
++    // 2 vblanks) from how late its frames run, but it times only its own CPU work ([fw+0x128],
++    // calc), which is fast under emulation where the GPU thread is the slow part: it stayed at 1
++    // and the game ran in slow motion. The same loop also stores the whole frame's time
++    // ([fw+0xe8], calc + draw + present), so the interval code is pointed at that one.
++    // From ZendNevs' Eglantine-MKW-DynamicFPS build.
++    const bool mkw_dynamic = Settings::values.mkw_dynamic_fps.GetValue();
++    if ((mkw_dynamic || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
++        process.GetProgramId() == 0x0400C3F00006E000ULL) {
++        constexpr u32 ModeLoadInsn = 0xB9421268; // ldr w8, [x19, #0x210]
++        const u32 mode_insn = mkw_dynamic ? 0x52800008U  // mov w8, #0
++                                          : 0x52800048U; // mov w8, #2
++        const auto& text = nso_header.segments[0];
++        u8* const code = codeset.memory.data() + module_start + text.location;
++        const size_t count = text.size / sizeof(u32);
++        const auto word = [code](size_t index) {
++            u32 value;
++            std::memcpy(&value, code + index * sizeof(u32), sizeof(value));
++            return value;
++        };
++        size_t found = 0;
++        size_t matches = 0;
++        for (size_t i = 2; i + 8 < count; ++i) {
++            if (word(i) != ModeLoadInsn || word(i - 2) != 0x6B01013F || // cmp w9, w1
++                (word(i - 1) & 0xFF00001F) != 0x54000001 ||             // b.ne
++                (word(i + 1) & 0xFF00001F) != 0x35000008) {             // cbnz w8
++                continue;
++            }
++            for (size_t j = i + 2; j < i + 8; ++j) {
++                if (word(j) == 0x52A84E08) { // mov w8, #0x42700000
++                    found = i;
++                    ++matches;
++                    break;
++                }
++            }
++        }
++        // Dynamic: the frame time load after it, ldr xN, [x19, #0x128] -> [x19, #0xe8].
++        size_t frame_time = 0;
++        if (matches == 1 && mkw_dynamic) {
++            for (size_t j = found + 1; j < found + 32 && j < count; ++j) {
++                if ((word(j) & 0xFFFFFFE0) == 0xF9409660) {
++                    frame_time = j;
++                    break;
++                }
++            }
++        }
++        if (matches == 1 && mkw_dynamic && frame_time == 0) {
++            LOG_WARNING(Loader, "Mario Kart World: dynamic FPS not applied (frame time not found)");
++        } else if (matches == 1) {
++            std::memcpy(code + found * sizeof(u32), &mode_insn, sizeof(mode_insn));
++            if (mkw_dynamic) {
++                const u32 whole_frame = 0xF9407660 | (word(frame_time) & 0x1F);
++                std::memcpy(code + frame_time * sizeof(u32), &whole_frame, sizeof(whole_frame));
++            }
++            LOG_INFO(Loader, "Mario Kart World: {} on (main+{:#x})",
++                     mkw_dynamic ? "dynamic FPS" : "30 FPS mode",
++                     text.location + found * sizeof(u32));
++        } else {
++            LOG_WARNING(Loader, "Mario Kart World: frame rate mode not patched ({} matches)",
++                        matches);
++        }
++    }
++
+ #ifdef HAS_NCE
+     // If we are computing the process code layout and using nce backend, patch.
+     const auto& code = codeset.CodeSegment();
+diff --git a/src/qt_common/config/shared_translation.cpp b/src/qt_common/config/shared_translation.cpp
+index 37f5a89f26..a2136aef04 100644
+--- a/src/qt_common/config/shared_translation.cpp
++++ b/src/qt_common/config/shared_translation.cpp
+@@ -273,6 +273,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
+     INSERT(Settings, use_video_framerate, tr("Sync to framerate of video playback"),
+            tr("Run the game at normal speed during video playback, even when the framerate is "
+               "unlocked."));
++    INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
++           tr("Keeps Mario Kart World in its own 30 FPS mode: steady 30 fps at normal game speed "
++              "instead of a slowed-down game when 60 fps can't be held.\nTakes effect at the "
++              "next game launch."));
++    INSERT(Settings, mkw_dynamic_fps, tr("Mario Kart World: dynamic FPS"),
++           tr("Normal game speed whatever the frame rate: below 60 fps the game advances two "
++              "vblanks on slow frames instead of slowing down, and it never runs faster than "
++              "60. Takes precedence over the 30 FPS mode.\nTakes effect at the next game "
++              "launch."));
+     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
+            tr("Improves rendering of transparency effects in specific games."));
+     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index a9be2ec7a8..5292a45e75 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -14,14 +14,19 @@ add_executable(tests
+     common/range_map.cpp
+     common/ring_buffer.cpp
+     common/scratch_buffer.cpp
++    common/slot_vector.cpp
+     common/undefined_fix.cpp
+     common/unique_function.cpp
+     core/core_timing.cpp
+     core/nup_writer.cpp
++    core/priority_queue.cpp
+     core/internal_network/network.cpp
+     video_core/memory_tracker.cpp
+     video_core/vertex_repack.cpp
+     video_core/ampere_returns.cpp
++    video_core/native_macro_fifo.cpp
++    video_core/uniform_stream_reuse.cpp
++    video_core/shader_invalidation.cpp
+     input_common/calibration_configuration_job.cpp
+ )
+ 
+diff --git a/src/tests/common/slot_vector.cpp b/src/tests/common/slot_vector.cpp
+new file mode 100644
+index 0000000000..d8f242085c
+--- /dev/null
++++ b/src/tests/common/slot_vector.cpp
+@@ -0,0 +1,54 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <map>
++#include <random>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include "common/slot_vector.h"
++
++TEST_CASE("SlotVector visits live entries across empty bitmap words", "[common]") {
++    Common::SlotVector<u32> slots;
++    std::vector<Common::SlotId> ids;
++    for (u32 i = 0; i < 513; ++i) {
++        ids.push_back(slots.insert(i));
++    }
++    for (u32 i = 0; i < 512; ++i) {
++        slots.erase(ids[i]);
++    }
++    auto it = slots.begin();
++    REQUIRE(it != slots.end());
++    REQUIRE((*it).first == ids[512]);
++    REQUIRE(*(*it).second == 512);
++    REQUIRE(++it == slots.end());
++    slots.erase(ids[512]);
++    REQUIRE(slots.begin() == slots.end());
++}
++
++TEST_CASE("SlotVector sparse iteration matches a live-entry model", "[common]") {
++    Common::SlotVector<u32> slots;
++    std::map<u32, u32> live;
++    std::mt19937 random{9813};
++    for (u32 batch = 0; batch < 200; ++batch) {
++        for (u32 i = 0; i < 100; ++i) {
++            if (!live.empty() && (random() % 3) == 0) {
++                auto selected = live.begin();
++                std::advance(selected, random() % live.size());
++                slots.erase(Common::SlotId{selected->first});
++                live.erase(selected);
++            } else {
++                const u32 value = random();
++                const auto id = slots.insert(value);
++                live.emplace(id.Value(), value);
++            }
++        }
++        auto expected = live.begin();
++        for (const auto [id, value] : slots) {
++            REQUIRE(expected != live.end());
++            REQUIRE(id.Value() == expected->first);
++            REQUIRE(*value == expected->second);
++            ++expected;
++        }
++        REQUIRE(expected == live.end());
++    }
++}
+diff --git a/src/tests/core/priority_queue.cpp b/src/tests/core/priority_queue.cpp
+new file mode 100644
+index 0000000000..0d7174f793
+--- /dev/null
++++ b/src/tests/core/priority_queue.cpp
+@@ -0,0 +1,111 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <algorithm>
++#include <array>
++#include <random>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include "core/hle/kernel/k_priority_queue.h"
++
++namespace {
++struct Affinity {
++    u64 GetAffinityMask() const {
++        return 3;
++    }
++    void SetAffinityMask(u64) {}
++    bool GetAffinity(s32) const {
++        return true;
++    }
++    void SetAffinity(s32, bool) {}
++    void SetAll() {}
++};
++
++struct Member {
++    struct QueueEntry {
++        Member* prev{};
++        Member* next{};
++        void Initialize() {
++            prev = next = nullptr;
++        }
++        void SetPrev(Member* value) {
++            prev = value;
++        }
++        void SetNext(Member* value) {
++            next = value;
++        }
++        Member* GetNext() const {
++            return next;
++        }
++        Member* GetPrev() const {
++            return prev;
++        }
++    };
++    std::array<QueueEntry, 2> entries{};
++    s32 priority{};
++    QueueEntry& GetPriorityQueueEntry(s32 core) {
++        return entries[core];
++    }
++    const QueueEntry& GetPriorityQueueEntry(s32 core) const {
++        return entries[core];
++    }
++    Affinity GetAffinityMask() const {
++        return {};
++    }
++    s32 GetActiveCore() const {
++        return 0;
++    }
++    s32 GetPriority() const {
++        return priority;
++    }
++    bool IsDummyThread() const {
++        return false;
++    }
++};
++
++template <size_t Priorities>
++void CheckQueue() {
++    using Queue = Kernel::KPriorityQueue<Member, 2, Priorities - 1, 0>;
++    typename Queue::KPriorityQueueImpl queue;
++    std::array<Member, 160> members{};
++    std::array<std::array<bool, 2>, 160> present{};
++    std::array<std::array<std::vector<Member*>, Priorities>, 2> model{};
++    std::mt19937 random{6152};
++    for (size_t i = 0; i < members.size(); ++i) {
++        members[i].priority = static_cast<s32>(i % Priorities);
++    }
++    REQUIRE(queue.GetFront(0) == nullptr);
++    for (u32 operation = 0; operation < 3000; ++operation) {
++        const size_t index = random() % members.size();
++        const s32 core = random() % 2;
++        auto& member = members[index];
++        auto& expected = model[core][member.priority];
++        if (present[index][core]) {
++            queue.Remove(member.priority, core, &member);
++            std::erase(expected, &member);
++        } else if ((random() & 1) != 0) {
++            queue.PushFront(member.priority, core, &member);
++            expected.insert(expected.begin(), &member);
++        } else {
++            queue.PushBack(member.priority, core, &member);
++            expected.push_back(&member);
++        }
++        present[index][core] = !present[index][core];
++        for (s32 checked_core = 0; checked_core < 2; ++checked_core) {
++            Member* actual = queue.GetFront(checked_core);
++            for (const auto& priority : model[checked_core]) {
++                for (Member* wanted : priority) {
++                    REQUIRE(actual == wanted);
++                    actual = queue.GetNext(checked_core, actual);
++                }
++            }
++            REQUIRE(actual == nullptr);
++        }
++    }
++}
++} // namespace
++
++TEST_CASE("Priority queue bitmap traversal preserves thread order", "[core]") {
++    CheckQueue<64>();
++    CheckQueue<128>();
++}
+diff --git a/src/tests/video_core/native_macro_fifo.cpp b/src/tests/video_core/native_macro_fifo.cpp
+new file mode 100644
+index 0000000000..e19b146192
+--- /dev/null
++++ b/src/tests/video_core/native_macro_fifo.cpp
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <array>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++
++#ifdef ARCHITECTURE_x86_64
++#include "video_core/macro_turing_jit.h"
++
++namespace {
++std::array<u32, 3> FifoInstruction(u32 method, bool end) {
++    std::array<u32, 3> bits{};
++    const auto field = [&](u32 offset, u32 count, u32 value) {
++        for (u32 bit = 0; bit < count; ++bit) {
++            bits[(offset + bit) / 32] |= ((value >> bit) & 1) << ((offset + bit) % 32);
++        }
++    };
++    field(0, 1, end);
++    for (u32 lane = 0; lane < 2; ++lane) {
++        field(15 + lane * 36, 5, 24);
++        field(20 + lane * 36, 5, 24);
++        field(25 + lane * 36, 5, 24);
++    }
++    field(30, 16, method);
++    field(82, 3, 5);
++    field(85, 4, 3);
++    return {bits[2], bits[1], bits[0]};
++}
++} // namespace
++
++TEST_CASE("Owned native macro FIFOs preserve loads across DMA appends and repeated calls",
++          "[video_core][native_macro]") {
++    std::vector<u32> code;
++    for (const auto instruction : {FifoInstruction(0x158, false), FifoInstruction(0x200, true),
++                                   FifoInstruction(0x201, false)}) {
++        code.insert(code.end(), instruction.begin(), instruction.end());
++    }
++    Tegra::TuringMacroJit jit;
++    jit.Prepare(code, 1);
++    std::array<u32, 0xc00> ram{};
++    std::vector<u32> parameters;
++    std::vector<u32> reference;
++    for (u32 invocation = 0; invocation < 1000; ++invocation) {
++        const u32 count = 2 + invocation % 127;
++        parameters.push_back(count);
++        reference.assign(parameters.begin(), parameters.end());
++        const auto run = [&](std::vector<u32>& input) {
++            std::vector<std::pair<u32, u32>> writes;
++            const auto result = jit.Execute(
++                0, input, ram, [](u32) { return 0U; },
++                [&](u32 method, u32 value) {
++                    writes.emplace_back(method, value);
++                    if (method == 0x158) {
++                        for (u32 word = 0; word < value; ++word) {
++                            input.push_back(invocation * 256 + word);
++                        }
++                    }
++                    return true;
++                });
++            CHECK(result.success);
++            CHECK(result.consumed == 3);
++            return writes;
++        };
++        const auto expected = run(reference);
++        const auto actual = run(parameters);
++        REQUIRE(actual.size() == 3);
++        CHECK(actual == expected);
++        CHECK(parameters == reference);
++        CHECK(actual[1] == std::pair<u32, u32>{0x200, invocation * 256});
++        CHECK(actual[2] == std::pair<u32, u32>{0x201, invocation * 256 + 1});
++        parameters.clear();
++    }
++}
++#endif
+diff --git a/src/tests/video_core/shader_invalidation.cpp b/src/tests/video_core/shader_invalidation.cpp
+new file mode 100644
+index 0000000000..806fb5c58d
+--- /dev/null
++++ b/src/tests/video_core/shader_invalidation.cpp
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <array>
++#include <chrono>
++#include <iostream>
++#include <memory>
++#include <random>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include "core/device_memory.h"
++#include "video_core/shader_cache.h"
++
++namespace VideoCommon {
++struct ShaderCacheTestAccess {
++    static std::unique_ptr<ShaderCache> Create(Tegra::MaxwellDeviceMemoryManager& memory) {
++        return std::unique_ptr<ShaderCache>{new ShaderCache{memory}};
++    }
++    static void Register(ShaderCache& cache, VAddr address, size_t size, u64 hash) {
++        auto data = std::make_unique<ShaderInfo>();
++        data->unique_hash = hash;
++        cache.Register(std::move(data), address, size);
++    }
++    static const ShaderInfo* Find(const ShaderCache& cache, VAddr address) {
++        return cache.TryGet(address);
++    }
++};
++} // namespace VideoCommon
++
++using VideoCommon::ShaderCacheTestAccess;
++
++TEST_CASE("Shader batch invalidation matches sequential cache contents", "[shader_invalidation]") {
++    Core::DeviceMemory memory;
++    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
++    auto batched = ShaderCacheTestAccess::Create(device_memory);
++    auto sequential = ShaderCacheTestAccess::Create(device_memory);
++    std::mt19937 random{0x16'67};
++    constexpr VAddr base = 0x100000;
++    for (unsigned iteration = 0; iteration < 600; ++iteration) {
++        for (unsigned slot = 0; slot < 128; ++slot) {
++            const auto address = base + slot * 4096;
++            if (!ShaderCacheTestAccess::Find(*batched, address)) {
++                const auto size = 1 + random() % 65536;
++                ShaderCacheTestAccess::Register(*batched, address, size, iteration + slot);
++                ShaderCacheTestAccess::Register(*sequential, address, size, iteration + slot);
++            }
++        }
++        std::vector<std::pair<DAddr, size_t>> writes;
++        for (unsigned i = 0, count = random() % 24; i < count; ++i) {
++            writes.emplace_back(base + random() % (128 * 4096), random() % 32768);
++            if (i % 4 == 0) {
++                writes.push_back(writes.back());
++            }
++        }
++        for (const auto& [address, size] : writes) {
++            sequential->InvalidateRegion(address, size);
++        }
++        batched->InvalidateRegions(writes);
++        for (unsigned slot = 0; slot < 128; ++slot) {
++            const auto address = base + slot * 4096;
++            const auto actual = ShaderCacheTestAccess::Find(*batched, address);
++            const auto expected = ShaderCacheTestAccess::Find(*sequential, address);
++            REQUIRE(bool(actual) == bool(expected));
++            if (actual) {
++                REQUIRE(actual->unique_hash == expected->unique_hash);
++            }
++        }
++    }
++}
++
++TEST_CASE("Shader empty batches preserve pending invalidations", "[shader_invalidation]") {
++    Core::DeviceMemory memory;
++    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
++    auto cache = ShaderCacheTestAccess::Create(device_memory);
++    constexpr VAddr address = 0x100000;
++    ShaderCacheTestAccess::Register(*cache, address, 32768, 123);
++    cache->OnCacheInvalidation(address, 1);
++    cache->InvalidateRegions({});
++    REQUIRE(ShaderCacheTestAccess::Find(*cache, address));
++    const std::array unrelated{std::pair<DAddr, size_t>{address + 0x100000, 4096}};
++    cache->InvalidateRegions(unrelated);
++    REQUIRE_FALSE(ShaderCacheTestAccess::Find(*cache, address));
++}
++
++TEST_CASE("Shader invalidation CPU benchmark", "[.][cache_bench]") {
++    Core::DeviceMemory memory;
++    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
++    auto batched = ShaderCacheTestAccess::Create(device_memory);
++    auto sequential = ShaderCacheTestAccess::Create(device_memory);
++    std::vector<std::pair<DAddr, size_t>> writes;
++    constexpr VAddr base = 0x100000;
++    for (unsigned slot = 0; slot < 768; ++slot) {
++        writes.emplace_back(base + slot * 65536, 1);
++    }
++    double sequential_ms{}, batched_ms{};
++    for (unsigned repeat = 0; repeat < 20; ++repeat) {
++        for (unsigned slot = 0; slot < 1024; ++slot) {
++            const auto address = base + slot * 65536;
++            if (!ShaderCacheTestAccess::Find(*batched, address)) {
++                ShaderCacheTestAccess::Register(*batched, address, 64, slot);
++                ShaderCacheTestAccess::Register(*sequential, address, 64, slot);
++            }
++        }
++        auto start = std::chrono::steady_clock::now();
++        for (const auto& [address, size] : writes) {
++            sequential->InvalidateRegion(address, size);
++        }
++        sequential_ms +=
++            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
++                .count();
++        start = std::chrono::steady_clock::now();
++        batched->InvalidateRegions(writes);
++        batched_ms +=
++            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
++                .count();
++        REQUIRE_FALSE(ShaderCacheTestAccess::Find(*batched, base));
++        REQUIRE(ShaderCacheTestAccess::Find(*batched, base + 1023 * 65536));
++    }
++    std::cout << "Shader invalidation: sequential=" << sequential_ms << " ms batched=" << batched_ms
++              << " ms (CPU only, not gameplay FPS)\n";
++}
+diff --git a/src/tests/video_core/uniform_stream_reuse.cpp b/src/tests/video_core/uniform_stream_reuse.cpp
+new file mode 100644
+index 0000000000..6059b70eeb
+--- /dev/null
++++ b/src/tests/video_core/uniform_stream_reuse.cpp
+@@ -0,0 +1,116 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <span>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++
++#include "video_core/buffer_cache/uniform_stream_reuse.h"
++
++namespace {
++void Check(bool condition, const char* message) {
++    INFO(message);
++    REQUIRE(condition);
++}
++
++struct Memory {
++    std::array<u8, 8192> bytes{};
++    void ReadBlockUnsafe(u64 address, void* destination, u32 size) {
++        Check(address + size <= bytes.size(), "read outside guest memory");
++        std::memcpy(destination, bytes.data() + address, size);
++    }
++};
++
++struct Runtime {
++    struct StreamUniformRef {
++        size_t allocation;
++    };
++    std::vector<std::vector<u8>> allocations;
++    StreamUniformRef last{}, bound{};
++    u64 tick{1};
++    u64 CurrentTick() const {
++        return tick;
++    }
++    StreamUniformRef LastStreamUniformRef() const {
++        return last;
++    }
++    std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
++        allocations.emplace_back(size);
++        last = bound = StreamUniformRef{allocations.size() - 1};
++        return allocations.back();
++    }
++    void RebindStreamUniform(StreamUniformRef ref, u32 size) {
++        Check(ref.allocation < allocations.size(), "reused a recycled allocation");
++        Check(allocations[ref.allocation].size() == size, "reused wrong allocation size");
++        bound = ref;
++    }
++    void NextTick() {
++        ++tick;
++        allocations.clear();
++    }
++};
++
++void CheckBound(const Runtime& runtime, const Memory& memory, u64 address, u32 size) {
++    const auto& bytes = runtime.allocations.at(runtime.bound.allocation);
++    Check(bytes.size() == size &&
++              std::memcmp(bytes.data(), memory.bytes.data() + address, size) == 0,
++          "bound uniform data differs from guest memory");
++}
++} // namespace
++
++TEST_CASE("Uniform stream reuse preserves data through mutation and session resets",
++          "[video_core]") {
++    using VideoCommon::BindSmallUniformReusing;
++    Memory memory;
++    Runtime runtime;
++    VideoCommon::ResetUniformStreamReuse<Runtime>();
++    auto bind = [&](size_t stage, u32 slot, u64 address, u32 size) {
++        Check(BindSmallUniformReusing(runtime, memory, stage, slot, slot, address, size),
++              "valid small uniform rejected");
++        CheckBound(runtime, memory, address, size);
++    };
++    bind(0, 0, 0, 64);
++    bind(0, 0, 0, 64);
++    Check(runtime.allocations.size() == 1, "identical bytes were copied twice");
++    memory.bytes[7] = 23;
++    bind(0, 0, 0, 64);
++    Check(runtime.allocations.size() == 2, "changed bytes reused stale data");
++    bind(0, 1, 0, 64);
++    bind(1, 0, 0, 64);
++    Check(runtime.allocations.size() == 4, "stage or slot shared the wrong allocation");
++    runtime.NextTick();
++    bind(0, 0, 0, 64);
++    Check(runtime.allocations.size() == 1, "a new command buffer reused an old allocation");
++    VideoCommon::ResetUniformStreamReuse<Runtime>();
++    bind(0, 0, 0, 64);
++    Check(runtime.allocations.size() == 2, "session reset retained an old allocation");
++    bind(4, 17, 0, 4096);
++    const auto before = runtime.allocations.size();
++    for (auto [stage, slot, size] :
++         {std::array<u32, 3>{5, 0, 64}, {0, 18, 64}, {0, 0, 0}, {0, 0, 4097}}) {
++        Check(!BindSmallUniformReusing(runtime, memory, stage, slot, slot, 0, size),
++              "invalid uniform range did not use the fallback");
++    }
++    Check(runtime.allocations.size() == before, "fallback allocated stream memory");
++
++    u32 random = 17;
++    for (u32 index = 0; index < 10000; ++index) {
++        random = random * 1664525U + 1013904223U;
++        if (index % 37 == 0)
++            runtime.NextTick();
++        if (index % 503 == 0)
++            VideoCommon::ResetUniformStreamReuse<Runtime>();
++        const u32 size = 1 + random % 4096;
++        const u64 address = (random >> 12) % (memory.bytes.size() - 4096);
++        if (index % 3 == 0)
++            memory.bytes[address + random % size] ^= u8{0x5a};
++        const size_t stage = (random >> 20) % 5;
++        const u32 slot = (random >> 24) % 18;
++        bind(stage, slot, address, size);
++        bind(stage, slot, address, size);
++    }
++}
+diff --git a/src/tests/video_core/vertex_repack.cpp b/src/tests/video_core/vertex_repack.cpp
+index 6409be3ca4..3705a97926 100644
+--- a/src/tests/video_core/vertex_repack.cpp
++++ b/src/tests/video_core/vertex_repack.cpp
+@@ -85,7 +85,8 @@ TEST_CASE("Static vertex repacking requires explicit experimental opt-in", "[ver
+ TEST_CASE("Vertex repack planning keeps descriptor offsets aligned", "[vertex_repack]") {
+     for (const u32 alignment : {4U, 16U, 64U, 256U, 4096U}) {
+         for (const u32 offset : {0U, 1U, 3U, 255U, 4099U}) {
+-            const auto plan = Vulkan::MakeVertexRepackParameters(offset, 70, alignment, 1U << 20, 65535);
++            const auto plan = Vulkan::MakeVertexRepackParameters(offset, 70, alignment, 1U << 20,
++                                                                 65535, 1U << 20);
+             REQUIRE(plan.has_value());
+             REQUIRE(plan->source_base % alignment == 0);
+             REQUIRE(plan->source_base + plan->source_bias == offset);
+@@ -99,13 +100,22 @@ TEST_CASE("Vertex repack planning keeps descriptor offsets aligned", "[vertex_re
+ }
+ 
+ TEST_CASE("Vertex repack planning rejects overflow and device-limit violations", "[vertex_repack]") {
+-    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 0, 256, 1U << 20, 65535));
+-    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 69, 0, 1U << 20, 65535));
+-    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 69, 256, 71, 65535));
+-    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(255, 69, 256, 323, 65535));
+-    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 69, 256, 1U << 20, 0));
+-    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 0xffffffffU, 256, ~u64{0}, 0xffffffffU));
+-    const auto one = Vulkan::MakeVertexRepackParameters(0, 69, 256, 72, 1);
++    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 0, 256, 1U << 20, 65535, 1U << 20));
++    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 69, 0, 1U << 20, 65535, 1U << 20));
++    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 69, 256, 71, 65535, 1U << 20));
++    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(255, 69, 256, 323, 65535, 1U << 20));
++    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 69, 256, 1U << 20, 0, 1U << 20));
++    REQUIRE_FALSE(
++        Vulkan::MakeVertexRepackParameters(0, 0xffffffffU, 256, ~u64{0}, 0xffffffffU, ~u64{0}));
++    const auto one = Vulkan::MakeVertexRepackParameters(0, 69, 256, 72, 1, 72);
+     REQUIRE(one.has_value());
+     REQUIRE(one->source_range == 72);
+ }
++
++TEST_CASE("Vertex repack planning keeps the source range inside the buffer", "[vertex_repack]") {
++    const auto clamped = Vulkan::MakeVertexRepackParameters(0, 69, 256, 1U << 20, 65535, 69);
++    REQUIRE(clamped.has_value());
++    REQUIRE(clamped->source_range == 69);
++    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(0, 69, 256, 1U << 20, 65535, 68));
++    REQUIRE_FALSE(Vulkan::MakeVertexRepackParameters(300, 69, 256, 1U << 20, 65535, 256));
++}
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 53bbae7610..6878780866 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -10,6 +10,7 @@
+ #include <memory>
+ #include <numeric>
+ #include <stdexcept>
++#include <utility>
+ #include <vector>
+ #include <fmt/ranges.h>
+ 
+@@ -174,11 +175,13 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
+ 
+ template <class P>
+ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
++    Nx2NoteListHostWrite(device_addr, size);
+     if (IsRegionGpuModified(device_addr, size)) {
+         ClearDownload(device_addr, size);
+         gpu_modified_ranges.Subtract(device_addr, size);
+     }
+     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
++    MarkVertexBuffersStale(device_addr, size);
+ }
+ 
+ template <class P>
+@@ -194,6 +197,7 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+         return;
+     }
+ 
++    Nx2NoteListHostWrite(device_addr, size);
+     tmp_buffer.resize_destructive(size);
+     device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
+ 
+@@ -263,6 +267,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+     }
+ 
+     ClearDownload(*cpu_dest_address, amount);
++    MarkVertexBuffersStale(*cpu_dest_address, amount);
+ 
+     BufferId buffer_a;
+     BufferId buffer_b;
+@@ -301,6 +306,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+         gpu_modified_ranges.Add(pair.first, pair.second);
+         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+             Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
++            Nx2NoteListWrite(buffer_b, pair.first, pair.second);
+         }
+     }
+     const auto& copy = copies[0];
+@@ -889,8 +895,40 @@ void BufferCache<P>::UpdateVertexBufferSlot(u32 index, const Binding& binding) {
+     }
+ }
+ 
++template <class P>
++void BufferCache<P>::MarkVertexBuffersStale(DAddr device_addr, u64 size) {
++    if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
++        u32 mask = enabled_vertex_buffers_mask;
++        while (mask != 0) {
++            const u32 index = std::countr_zero(mask);
++            mask &= mask - 1;
++            const Binding& binding = v_buffer[index];
++            if (device_addr < binding.device_addr + binding.size &&
++                binding.device_addr < device_addr + size) {
++                stale_vertex_buffers_mask |= 1U << index;
++            }
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::RefreshRepackedVertexBuffers() {
++    if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
++        u32 mask = std::exchange(stale_vertex_buffers_mask, 0) & enabled_vertex_buffers_mask;
++        auto& flags = maxwell3d->dirty.flags;
++        while (mask != 0) {
++            const u32 index = std::countr_zero(mask);
++            mask &= mask - 1;
++            if (runtime.IsVertexRepacked(index)) {
++                flags[Dirty::VertexBuffer0 + index] = true;
++            }
++        }
++    }
++}
++
+ template <class P>
+ void BufferCache<P>::BindHostVertexBuffers() {
++    RefreshRepackedVertexBuffers();
+ 
+ #ifdef __ANDROID__
+     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
+@@ -1652,6 +1690,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+         }
+     }
+     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
++    MarkVertexBuffersStale(device_addr, size);
+     gpu_modified_ranges.Add(device_addr, size);
+     if (DownloadsAtFence(device_addr, size)) {
+         uncommitted_gpu_modified_ranges.Add(device_addr, size);
+@@ -1660,6 +1699,194 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+     }
+     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+         Tegra::Nx2MarkGpuWritten(device_addr, size);
++        Nx2NoteListWrite(buffer_id, device_addr, size);
++    }
++}
++
++template <class P>
++void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64 size) {
++    if constexpr (!IS_OPENGL) {
++        if (size == 0 || !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
++            return;
++        }
++        constexpr u64 page_bits = Tegra::Nx2WrittenPageBits;
++        const u64 last = (std::min<u64>)((device_addr + size - 1) >> page_bits,
++                                         Tegra::g_nx2_command_list_pages.size() * 64 - 1);
++        for (u64 page = device_addr >> page_bits; page <= last;) {
++            // Storage buffers can be large: skip 64 pages at a time where none is a list page.
++            const u64 word =
++                Tegra::g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >>
++                (page % 64);
++            if (word == 0) {
++                page = (page / 64 + 1) * 64;
++                continue;
++            }
++            if (word & 1) {
++                const DAddr page_addr = page << page_bits;
++                {
++                    std::scoped_lock lock{nx2_list_mutex};
++                    Nx2ListPage& entry = nx2_list_pages[page_addr];
++                    ++entry.writes;
++                    if (!nx2_collect_list_copies && !entry.draw_written) {
++                        entry.draw_written = true;
++                        LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
++                                         "lists drain the split",
++                                 page_addr);
++                    }
++                }
++                if (nx2_collect_list_copies) {
++                    nx2_list_copy_requests.emplace_back(buffer_id, page_addr);
++                }
++            }
++            ++page;
++        }
++    }
++}
++
++template <class P>
++bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
++    if constexpr (IS_OPENGL) {
++        return false;
++    } else {
++        if (nx2_list_copy_requests.empty()) {
++            return false;
++        }
++        std::ranges::sort(nx2_list_copy_requests, {}, &std::pair<BufferId, DAddr>::second);
++        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
++        bool recorded = false;
++        for (size_t i = 0; i < nx2_list_copy_requests.size(); ++i) {
++            const auto [buffer_id, page] = nx2_list_copy_requests[i];
++            if (i + 1 < nx2_list_copy_requests.size() &&
++                nx2_list_copy_requests[i + 1].second == page) {
++                continue;
++            }
++            Buffer& buffer = slot_buffers[buffer_id];
++            const DAddr begin = (std::max<DAddr>)(page, buffer.CpuAddr());
++            const DAddr end =
++                (std::min<DAddr>)(page + page_size, buffer.CpuAddr() + buffer.SizeBytes());
++            if (begin >= end) {
++                continue;
++            }
++            Nx2Staging staging = runtime.DownloadStagingBuffer(page_size, true);
++            const BufferCopy copy{
++                .src_offset = buffer.Offset(begin),
++                .dst_offset = staging.offset + (begin - page),
++                .size = end - begin,
++            };
++            buffer.MarkUsage(copy.src_offset, copy.size);
++            runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
++            recorded = true;
++            std::scoped_lock lock{nx2_list_mutex};
++            Nx2ListPage& entry = nx2_list_pages[page];
++            if (entry.copy) {
++                nx2_retired_list_copies.emplace_back(entry.copy_tick, std::move(*entry.copy));
++            }
++            entry.copy = staging;
++            entry.copy_writes = entry.writes;
++            entry.copy_tick = tick;
++            entry.copy_begin = static_cast<u32>(begin - page);
++            entry.copy_end = static_cast<u32>(end - page);
++        }
++        nx2_list_copy_requests.clear();
++        std::erase_if(nx2_retired_list_copies, [this](auto& retired) {
++            if (!runtime.IsFree(retired.first)) {
++                return false;
++            }
++            runtime.FreeDeferredStagingBuffer(retired.second);
++            return true;
++        });
++        return recorded;
++    }
++}
++
++template <class P>
++auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx2ListRead {
++    if constexpr (IS_OPENGL) {
++        return Nx2ListRead::Unknown;
++    } else {
++        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
++        const DAddr page = device_addr & ~(page_size - 1);
++        const u64 offset = device_addr - page;
++        if (offset + out.size() > page_size) {
++            return Nx2ListRead::Unknown;
++        }
++        const auto current = [&](const Nx2ListPage& entry) {
++            return entry.copy && !entry.draw_written && entry.copy_writes == entry.writes &&
++                   offset >= entry.copy_begin && offset + out.size() <= entry.copy_end;
++        };
++        u64 tick{};
++        u64 writes{};
++        {
++            std::scoped_lock lock{nx2_list_mutex};
++            const auto it = nx2_list_pages.find(page);
++            if (it == nx2_list_pages.end()) {
++                return Nx2ListRead::Unknown;
++            }
++            const Nx2ListPage& entry = it->second;
++            // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
++            if (!entry.draw_written && entry.synced_writes == entry.writes) {
++                return Nx2ListRead::Synced;
++            }
++            if (!current(entry)) {
++                return Nx2ListRead::Unknown;
++            }
++            // The lists after the first of a batch find the copy done: read it at once.
++            if (runtime.IsFree(entry.copy_tick)) {
++                std::memcpy(out.data(), entry.copy->mapped_span.data() + offset, out.size());
++                return Nx2ListRead::Copied;
++            }
++            tick = entry.copy_tick;
++            writes = entry.copy_writes;
++        }
++        // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
++        runtime.WaitSubmittedTick(tick);
++        std::scoped_lock lock{nx2_list_mutex};
++        const auto it = nx2_list_pages.find(page);
++        if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||
++            it->second.copy_writes != writes) {
++            return Nx2ListRead::Unknown;
++        }
++        std::memcpy(out.data(), it->second.copy->mapped_span.data() + offset, out.size());
++        return Nx2ListRead::Copied;
++    }
++}
++
++template <class P>
++void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
++    if constexpr (!IS_OPENGL) {
++        std::scoped_lock lock{nx2_list_mutex};
++        Nx2ListPage& entry = nx2_list_pages[page];
++        entry.synced_writes = entry.writes;
++    }
++}
++
++template <class P>
++void BufferCache<P>::Nx2NoteListHostWrite(DAddr device_addr, u64 size) {
++    if constexpr (!IS_OPENGL) {
++        if (size == 0 || !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
++            return;
++        }
++        constexpr u64 page_bits = Tegra::Nx2WrittenPageBits;
++        const u64 last = (std::min<u64>)((device_addr + size - 1) >> page_bits,
++                                         Tegra::g_nx2_command_list_pages.size() * 64 - 1);
++        for (u64 page = device_addr >> page_bits; page <= last; ++page) {
++            if (!((Tegra::g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >>
++                   (page % 64)) &
++                  1)) {
++                continue;
++            }
++            std::scoped_lock lock{nx2_list_mutex};
++            const auto it = nx2_list_pages.find(page << page_bits);
++            if (it == nx2_list_pages.end()) {
++                continue;
++            }
++            Nx2ListPage& entry = it->second;
++            const bool synced = entry.synced_writes == entry.writes;
++            ++entry.writes;
++            if (synced) {
++                entry.synced_writes = entry.writes;
++            }
++        }
+     }
+ }
+ 
+@@ -2014,6 +2241,7 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
+                                                 std::span<const u8> inlined_buffer) {
+     ClearDownload(dest_address, copy_size);
+     gpu_modified_ranges.Subtract(dest_address, copy_size);
++    MarkVertexBuffersStale(dest_address, copy_size);
+ 
+     BufferId buffer_id = FindBuffer(dest_address, static_cast<u32>(copy_size), false);
+     auto& buffer = slot_buffers[buffer_id];
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 47f342932d..59be418030 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -14,7 +14,9 @@
+ #include <memory>
+ #include <mutex>
+ #include <numeric>
++#include <optional>
+ #include <span>
++#include <unordered_map>
+ #include <vector>
+ 
+ #include "common/container/unordered_map.h"
+@@ -321,6 +323,28 @@ public:
+ 
+     bool DMAClear(GPUVAddr src_address, u64 amount, u32 value);
+ 
++    /// Switch 2 GPU-written command lists (nx2.h, g_nx2_command_list_pages). While collecting (a
++    /// compute dispatch or a DMA copy being recorded), writes to command list pages are noted;
++    /// Nx2CopyListPages then records copies of those pages into host memory after the work.
++    void Nx2CollectListCopies(bool collect) {
++        nx2_collect_list_copies = collect;
++        if (!collect) {
++            nx2_list_copy_requests.clear();
++        }
++    }
++    /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
++    bool Nx2CopyListPages(u64 tick);
++    enum class Nx2ListRead { Unknown, Copied, Synced };
++    /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
++    /// written by no GPU work since), else Copied with `out` filled from the copy of its last
++    /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
++    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out);
++    /// Front thread, the split drained: the command list page was flushed to guest memory.
++    void Nx2NoteListSynced(DAddr page);
++    /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
++    /// no longer holds the page.
++    void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
++
+     /// Return true when a CPU region is modified from the GPU
+     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+ 
+@@ -440,6 +464,10 @@ private:
+ 
+     void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
+ 
++    /// Counts a GPU write to the command list pages in the range (invalidating their copies) and,
++    /// while collecting, asks for new copies.
++    void Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64 size);
++
+     [[nodiscard]] BufferId FindBuffer(DAddr device_addr, u32 size, bool sparse_compatible);
+ 
+     void SynchronizeBufferWrites(Buffer& buffer);
+@@ -497,6 +525,13 @@ private:
+ 
+     void UpdateVertexBufferSlot(u32 index, const Binding& binding);
+ 
++    /// Flags the vertex buffers overlapping a written range so host copies derived from them are
++    /// rebuilt.
++    void MarkVertexBuffersStale(DAddr device_addr, u64 size);
++
++    /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
++    void RefreshRepackedVertexBuffers();
++
+     void ClearDownload(DAddr base_addr, u64 size);
+ 
+     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
+@@ -517,6 +552,7 @@ private:
+     u32 last_index_count = 0;
+ 
+     u32 enabled_vertex_buffers_mask = 0;
++    u32 stale_vertex_buffers_mask = 0;
+     u64 vertex_buffers_serial = 0;
+     std::array<Binding, 32> v_buffer{};
+ 
+@@ -604,6 +640,29 @@ private:
+     // Covers the device address space (MaxwellDeviceTraits::device_virtual_bits).
+     std::array<BufferId, ((1ULL << 36) >> CACHING_PAGEBITS)> page_table;
+     Common::ScratchBuffer<u8> tmp_buffer;
++
++    /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
++    using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
++    struct Nx2ListPage {
++        u64 writes{};      ///< GPU writes noted to the page
++        u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
++        u64 copy_tick{};   ///< GPU tick that completes the copy
++        /// `writes` when the front last flushed the page: guest memory holds it while equal
++        u64 synced_writes{~u64{0}};
++        u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
++        u32 copy_end{};
++        /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
++        /// once: the front can't tell from what it sent whether such a write is still queued, so
++        /// the page's lists always drain the split instead of reading a copy.
++        bool draw_written{};
++        std::optional<Nx2Staging> copy;
++    };
++    std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
++    std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
++    /// Copies replaced while the GPU may still write them: freed once it is past their tick.
++    std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
++    boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
++    bool nx2_collect_list_copies{};
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/control/scheduler.cpp b/src/video_core/control/scheduler.cpp
+index dc42906752..97d2dcd482 100644
+--- a/src/video_core/control/scheduler.cpp
++++ b/src/video_core/control/scheduler.cpp
+@@ -48,6 +48,7 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
+         std::find(pending_channels.begin(), pending_channels.end(), channel_state) ==
+             pending_channels.end()) {
+         pending_channels.push_back(channel_state);
++        any_pending.store(true, std::memory_order_release);
+     }
+     if (!pending_channels.empty()) {
+         ResumePending(gpu);
+@@ -77,6 +78,7 @@ void Scheduler::ResumePending(GPU& gpu) {
+     std::erase_if(pending_channels, [](const auto& state) {
+         return !state->payload->dma_pusher.HasPendingAcquire();
+     });
++    any_pending.store(!pending_channels.empty(), std::memory_order_release);
+ }
+ 
+ void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {
+diff --git a/src/video_core/control/scheduler.h b/src/video_core/control/scheduler.h
+index 9a0f1b919f..b1aaf46b60 100644
+--- a/src/video_core/control/scheduler.h
++++ b/src/video_core/control/scheduler.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
+ #include <mutex>
+ #include <vector>
+@@ -30,6 +31,10 @@ public:
+     [[nodiscard]] bool HasPendingChannels() const {
+         return !pending_channels.empty();
+     }
++    /// HasPendingChannels for threads other than the GPU thread.
++    [[nodiscard]] bool HasPendingChannelsAnyThread() const {
++        return any_pending.load(std::memory_order_acquire);
++    }
+ 
+     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
+ 
+@@ -39,6 +44,7 @@ private:
+     ::Common::unordered_map<s32, std::shared_ptr<ChannelState>> channels;
+     std::mutex scheduling_guard;
+     std::vector<std::shared_ptr<ChannelState>> pending_channels; ///< Suspended on an acquire
++    std::atomic<bool> any_pending{};
+ };
+ 
+ } // namespace Control
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 1144488c91..6a79e0570e 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -9,6 +9,7 @@
+ #include <cstdlib>
+ #include <cstdio>
+ 
++#include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "core/memory.h"
+@@ -161,6 +162,9 @@ bool DmaPusher::Step() {
+         // read: their words at submit time are an older frame's.
+         const bool submitted = command_resume_offset == 0 &&
+                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
++                               (command_list.snapshot_suspensions & 1) == 0 &&
++                               command_list.snapshot_suspensions ==
++                                   suspensions.load(std::memory_order_acquire) &&
+                                !IsGpuWrittenCommands(dma_state.dma_get,
+                                                      size_t{header.size} * sizeof(u32)) &&
+                                !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
+@@ -178,6 +182,11 @@ bool DmaPusher::Step() {
+             RecordParsedEntry(header, commands);
+             command_resume_offset +=
+                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
++        } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
++            const std::span<const CommandHeader> commands{command_headers.data(), header.size};
++            RecordParsedEntry(header, commands);
++            command_resume_offset +=
++                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+         } else {
+             FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+@@ -382,6 +391,15 @@ void DmaPusher::CallMethod(u32 argument) {
+             ReportUnboundSubchannel();
+             return;
+         }
++        // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
++        const auto engine_type = subchannel_type[dma_state.subchannel];
++        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
++                            engine_type == Engines::EngineTypes::MaxwellDMA;
++        SCOPE_EXIT {
++            if (writer) {
++                split.NoteWriter();
++            }
++        };
+         if (split.Active()) {
+             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
+             if (split.FrontMacros()) {
+@@ -432,6 +450,15 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+             ReportUnboundSubchannel();
+             return;
+         }
++        // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
++        const auto engine_type = subchannel_type[dma_state.subchannel];
++        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
++                            engine_type == Engines::EngineTypes::MaxwellDMA;
++        SCOPE_EXIT {
++            if (writer) {
++                split.NoteWriter();
++            }
++        };
+         if (split.Active()) {
+             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
+             if (split.FrontMacros()) {
+@@ -476,18 +503,86 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
+     return false;
+ }
+ 
++bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
++    // The pages are marked as command list pages: from the next write on, the buffer cache copies
++    // them to host memory right after the dispatch or copy that writes them and submits. The
++    // front then waits only for the back to run that work and for the GPU to finish the copy, not
++    // for everything queued and a cache flush (FlushGpuWrittenCommands: ~400 GPU round trips a
++    // second in a Mario Kart World race, during which the back had nothing to do). Pages
++    // FlushGpuWrittenCommands flushed whole and no GPU work wrote since are read from guest
++    // memory.
++    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || count == 0 ||
++        rasterizer == nullptr) {
++        return false;
++    }
++    const GPUVAddr end = address + u64{count} * sizeof(u32);
++    bool written = false;
++    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
++        if (const auto device = memory_manager.GpuToCpuAddress(page);
++            device && Tegra::Nx2IsGpuWritten(*device)) {
++            Tegra::Nx2MarkCommandListPage(*device);
++            written = true;
++        }
++    }
++    if (!written) {
++        return false;
++    }
++    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++        split.WaitForWriters();
++    }
++    using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
++    command_headers.resize_destructive(count);
++    u8* const out = reinterpret_cast<u8*>(command_headers.data());
++    for (GPUVAddr chunk = address; chunk < end;) {
++        const GPUVAddr chunk_end = (std::min)(end, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
++        const std::span<u8> part{out + (chunk - address), static_cast<size_t>(chunk_end - chunk)};
++        const auto device = memory_manager.GpuToCpuAddress(chunk);
++        if (!device) {
++            return false;
++        }
++        GpuWrittenList where = GpuWrittenList::Synced;
++        if (Tegra::Nx2IsGpuWritten(*device)) {
++            where = rasterizer->ReadGpuWrittenCommandList(*device, part);
++        }
++        if (where == GpuWrittenList::Unknown) {
++            return false;
++        }
++        if (where == GpuWrittenList::Synced) {
++            memory_manager.ReadBlockUnsafe(chunk, part.data(), part.size());
++        }
++        chunk = chunk_end;
++    }
++    return true;
++}
++
+ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+     // Title 1 runs small command lists its culling dispatches fill in each frame. Accurate GPU
+     // mode reads every command list through the caches (safe reads); here only the ones on pages
+     // the GPU has written are, or their draws run with an older frame's words (trees vanish).
++    // These are the lists ReadGpuWrittenCommands can't take from a copy or guest memory (a page's
++    // first list, or pages draws write too).
+     if (!IsGpuWrittenCommands(address, size)) {
+         return;
+     }
+     // The caches belong to the split's back: it first runs what the front queued (the dispatch
+-    // that writes these words among it).
++    // that writes these words among it). The whole pages are flushed: their next lists read
++    // guest memory until GPU work writes them again.
+     VideoCommon::GpuSplit::Get().Drain();
+-    if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
+-        memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
++    const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
++    const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
++    if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
++                                     VideoCommon::CacheType::BufferCache)) {
++        memory_manager.FlushRegion(first_page, end_page - first_page,
++                                   VideoCommon::CacheType::BufferCache);
++    }
++    if (rasterizer == nullptr) {
++        return;
++    }
++    for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
++        if (const auto device = memory_manager.GpuToCpuAddress(page);
++            device && Tegra::Nx2IsCommandListPage(*device)) {
++            rasterizer->NoteGpuWrittenCommandListSynced(*device);
++        }
+     }
+ }
+ 
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index e9dd5e2b6b..feab652bb5 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <condition_variable>
+ #include <optional>
+ #include <span>
+@@ -121,6 +122,10 @@ struct CommandList final {
+     /// executed instead of the memory, which the game may already be refilling for a later frame.
+     std::vector<CommandHeader> submitted_words;
+     std::vector<u32> submitted_offsets;
++    /// DmaPusher::suspensions when the words were copied. A list copied during a suspension, or
++    /// that waited behind one, reads memory instead: games write the commands it runs before they
++    /// release the acquire.
++    u64 snapshot_suspensions = 0;
+ };
+ 
+ /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
+@@ -139,6 +144,10 @@ inline u64 HashPushbufferWords(std::span<const u32> words) {
+ /// details on this implementation.
+ class DmaPusher final {
+ public:
++    /// Counts suspensions on a semaphore acquire and the resumes after them, so it is odd while
++    /// the channel is suspended (see CommandList::snapshot_suspensions).
++    std::atomic<u64> suspensions{0};
++
+     explicit DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_);
+     ~DmaPusher();
+ 
+@@ -188,6 +197,11 @@ public:
+     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+     /// Whether the entry lies on device pages the GPU has written (NX2).
+     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
++    /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
++    /// buffer cache made after the work that wrote them or from guest memory for pages flushed
++    /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
++    /// flushes and reads guest memory.
++    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
+     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+ 
+diff --git a/src/video_core/engines/draw_manager.cpp b/src/video_core/engines/draw_manager.cpp
+index 038e5a2e69..974a9a6e9a 100644
+--- a/src/video_core/engines/draw_manager.cpp
++++ b/src/video_core/engines/draw_manager.cpp
+@@ -72,11 +72,19 @@ void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
+     }
+ }
+ 
+-void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d) {
++void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues) {
+     if (draw_state.draw_mode != DrawMode::Instance || draw_state.instance_count == 0) {
++        if (!loop_continues) {
++            draw_state.drawn_instances = 0;
++        }
+         return;
+     }
+-    DrawEnd(maxwell3d, draw_state.instance_count + 1, true);
++    // The first draw of a batch also covers the loop's first instance; a batch that continues a
++    // loop split by a register write draws only the instances after the ones already drawn.
++    const bool continued = draw_state.drawn_instances != 0;
++    DrawEnd(maxwell3d, draw_state.instance_count + (continued ? 0 : 1), true);
++    draw_state.drawn_instances =
++        loop_continues ? draw_state.drawn_instances + draw_state.instance_count : 0;
+     draw_state.instance_count = 0;
+ }
+ 
+@@ -121,6 +129,7 @@ void Maxwell3D::DrawManager::DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D:
+     draw_state.vertex_buffer.count = vertex_count;
+     if (!subsequent) {
+         draw_state.instance_count = 1;
++        draw_state.drawn_instances = 0;
+     }
+     draw_state.base_instance = draw_state.instance_count - 1;
+     draw_state.draw_mode = DrawMode::Instance;
+@@ -220,6 +229,9 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
+         [[fallthrough]];
+     case DrawMode::General:
+         draw_state.base_instance = maxwell3d.regs.global_base_instance_index;
++        if (draw_state.draw_mode == DrawMode::Instance && draw_state.drawn_instances != 0) {
++            draw_state.base_instance += draw_state.drawn_instances + 1;
++        }
+         draw_state.base_index = maxwell3d.regs.global_base_vertex_index;
+         if (draw_state.draw_indexed) {
+             draw_state.index_buffer = maxwell3d.regs.index_buffer;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 9731f54584..92313988bd 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -342,7 +342,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+     // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
+     // c[0][0x644]) right after the loop, before the macro returns.
+     if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+-        draw_manager.DrawDeferred(*this);
++        draw_manager.DrawDeferred(*this, true);
+     }
+     regs.reg_array[method] = argument;
+     for (auto const& table : dirty.tables)
+@@ -518,6 +518,10 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
+     }
+     LOG_ERROR(HW_GPU, "Write to {:#x} while macro {:#x} collects parameters ({} so far); last writes:",
+               method, executing_macro, macro_params.size());
++    if (!record_write_history) {
++        LOG_ERROR(HW_GPU, "Register write history disabled; EDEN_NX2_3D_HISTORY=1 enables it");
++        return;
++    }
+     for (size_t i = 0; i < recent_writes.size(); ++i) {
+         const auto& w = recent_writes[(recent_write_index + i) % recent_writes.size()];
+         if (w.amount != 0) {
+@@ -537,7 +541,7 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
+     }
+     // As in ProcessDirtyRegisters: the paths below write without it.
+     if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+-        draw_manager.DrawDeferred(*this);
++        draw_manager.DrawDeferred(*this, true);
+     }
+     switch (method) {
+     case MAXWELL3D_REG_INDEX(const_buffer.buffer):
+@@ -818,7 +822,6 @@ struct Maxwell3D::FrontState {
+     Regs::ShadowRamControl control{};
+     u32 executing_macro{};
+     std::vector<u32> parameters;
+-    std::vector<u32> fifo;
+     u64 calls{};
+     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
+     /// then can it have a deferred instanced draw to issue at the end of a macro.
+@@ -1095,9 +1098,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+             engine.native_jit = std::make_shared<TuringMacroJit>();
+         }
+         engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+-        fs.fifo.assign(fs.parameters.begin(), fs.parameters.end());
++        const size_t parameter_count = fs.parameters.size();
+         const auto result = engine.native_jit->Execute(
+-            start, fs.fifo, std::span<u32>{native_data_ram},
++            start, fs.parameters, std::span<u32>{native_data_ram},
+             [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
+             [&](u32 address, u32 value) {
+                 if (address >= MacroRegistersStart) {
+@@ -1113,7 +1116,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+         if (!result.success) {
+             engine.native_execution_failed = true;
+             LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}",
+-                      start, result.consumed, fs.parameters.size(), result.error);
++                      start, result.consumed, parameter_count, result.error);
+         }
+     }
+     fs.parameters.clear();
+@@ -1148,7 +1151,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+         if (method == 0x158) {
+-            fs.fifo.push_back(word);
++            fs.parameters.push_back(word);
+         } else if (ram + i < native_data_ram.size()) {
+             native_data_ram[ram + i] = word;
+         }
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index af0e37978e..4feff955ee 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3069,6 +3069,8 @@ public:
+             Maxwell3D::Regs::IndexBuffer index_buffer;
+             u32 base_instance{};
+             u32 instance_count{};
++            /// Deferred instances already drawn by flushes in the middle of the current loop.
++            u32 drawn_instances{};
+             std::vector<u8> inline_index_draw_indexes;
+         };
+         struct DrawTextureState {
+@@ -3095,7 +3097,8 @@ public:
+         };
+         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
+         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
+-        void DrawDeferred(Maxwell3D& maxwell3d);
++        /// Draws the waiting instances. loop_continues is set when the loop goes on afterwards.
++        void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
+         /// Instances after the first wait to be drawn together (DrawDeferred).
+         [[nodiscard]] bool HasDeferredDraw() const noexcept {
+             return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
+@@ -3349,7 +3352,17 @@ private:
+     };
+     std::array<RecentWrite, 48> recent_writes{};
+     size_t recent_write_index = 0;
++    const bool record_write_history{
++#ifdef NDEBUG
++        std::getenv("EDEN_NX2_3D_HISTORY") != nullptr
++#else
++        true
++#endif
++    };
+     void RecordWrite(u32 method, u32 argument, u32 amount, u32 pending) {
++        if (!record_write_history) {
++            return;
++        }
+         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
+     }
+     void DumpRecentWrites(u32 method);
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 0bb1809aa3..37ac3ec851 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -116,6 +116,7 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
+         return false;
+     }
+     pending_acquire.reset();
++    dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+     Nx2SemaphoreWaiters::Get().Remove(this);
+     return true;
+ }
+@@ -257,6 +258,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+         dma_pusher.rasterizer->ReleaseFences();
+         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+             pending_acquire = acquire;
++            dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+         } else {
+             waiters.Remove(this);
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 53f8f063f7..444dc6d015 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -210,6 +210,10 @@ struct GPU::Impl {
+         gpu_thread.Run(std::move(func), is_async);
+     }
+ 
++    void MapInOrder(std::function<void()>&& func) {
++        gpu_thread.Run(std::move(func), is_async, true);
++    }
++
+     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
+     void FlushRegion(DAddr addr, u64 size) {
+         gpu_thread.FlushRegion(addr, size, is_async);
+@@ -505,6 +509,10 @@ bool GPU::IsAsync() const {
+     return impl->is_async;
+ }
+ 
++bool GPU::HasSuspendedChannels() const {
++    return impl->scheduler.HasPendingChannelsAnyThread();
++}
++
+ bool GPU::UseNvdec() const {
+     return impl->use_nvdec;
+ }
+@@ -549,6 +557,10 @@ void GPU::RunInOrder(std::function<void()>&& func) {
+     impl->RunInOrder(std::move(func));
+ }
+ 
++void GPU::MapInOrder(std::function<void()>&& func) {
++    impl->MapInOrder(std::move(func));
++}
++
+ void GPU::InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {
+     impl->InvalidateRegion(addr, size, preserve_gpu_writes);
+ }
+diff --git a/src/video_core/gpu.h b/src/video_core/gpu.h
+index 3a6546b41b..d37dfa5990 100644
+--- a/src/video_core/gpu.h
++++ b/src/video_core/gpu.h
+@@ -217,6 +217,9 @@ public:
+ 
+     [[nodiscard]] bool IsAsync() const;
+ 
++    /// Whether a channel is suspended on a semaphore acquire (callable from any thread).
++    [[nodiscard]] bool HasSuspendedChannels() const;
++
+     [[nodiscard]] bool UseNvdec() const;
+ 
+     void RendererFrameEndNotify();
+@@ -254,6 +257,10 @@ public:
+     /// Runs func on the GPU thread after the command lists submitted so far.
+     void RunInOrder(std::function<void()>&& func);
+ 
++    /// RunInOrder for GPU memory maps: also done before the GPU thread reads the command lists
++    /// submitted later (with the GPU split, on its front rather than its back).
++    void MapInOrder(std::function<void()>&& func);
++
+     /// Notify rasterizer that any caches of the specified region should be invalidated
+     void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes = false);
+ 
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index ac0d3f25f1..ef0cdae123 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -138,6 +138,7 @@ void GpuSplit::Stop() {
+     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
+     ring.reset();
+     write_position = 0;
++    last_writer_position = 0;
+     published_local = 0;
+     consumed_cache = 0;
+     publish_every = PublishEvery;
+@@ -216,6 +217,28 @@ void GpuSplit::Drain() {
+     }
+ }
+ 
++void GpuSplit::WaitForWriters() {
++    const u64 target = std::min(last_writer_position, write_position);
++    consumed_cache = consumed.load(std::memory_order_acquire);
++    if (consumed_cache >= target) {
++        return;
++    }
++    wait_target.store(target, std::memory_order_seq_cst);
++    Publish();
++    for (u32 spins = 0;; ++spins) {
++        consumed_cache = consumed.load(std::memory_order_acquire);
++        if (consumed_cache >= target) {
++            wait_target.store(~u64{0}, std::memory_order_relaxed);
++            return;
++        }
++        if (spins < 16384) {
++            Pause();
++        } else {
++            std::this_thread::yield();
++        }
++    }
++}
++
+ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
+     front_engine = engine;
+     u64* const entry = Reserve(2);
+@@ -346,8 +369,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+             const size_t index = read_position & RingMask;
+             const size_t size = Execute(&ring[index]);
+             read_position += size != 0 ? size : RingWords - index;
+-            // Hand ring space back now and then while working through a long batch.
+-            if (read_position - last_store >= 4096 && read_position != available) {
++            // Hand ring space back now and then while working through a long batch, and at once
++            // when the front waits for this position (WaitForWriters).
++            if ((read_position - last_store >= 4096 ||
++                 read_position >= wait_target.load(std::memory_order_relaxed)) &&
++                read_position != available) {
+                 consumed.store(read_position, std::memory_order_release);
+                 last_store = read_position;
+             }
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index d6f91e4141..c7c7118481 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -100,6 +100,13 @@ public:
+     /// Waits until the back executed everything sent so far.
+     void Drain();
+ 
++    /// Compute or copy work was just sent: what can write GPU-written command lists.
++    void NoteWriter() {
++        last_writer_position = write_position;
++    }
++    /// Waits until the back executed the compute and copy work sent so far (not what came after).
++    void WaitForWriters();
++
+ private:
+     enum class Kind : u64 {
+         Wrap,   ///< The rest of the ring is unused: continue at its start
+@@ -156,6 +163,7 @@ private:
+ 
+     // Front side.
+     u64 write_position{};
++    u64 last_writer_position{};
+     u64 published_local{};
+     u64 consumed_cache{};
+     /// Words between publishes: small right after a drain, while the back has nothing to do.
+@@ -169,6 +177,8 @@ private:
+ 
+     alignas(64) std::atomic<u64> published{};
+     alignas(64) std::atomic<u64> consumed{};
++    /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
++    alignas(64) std::atomic<u64> wait_target{~u64{0}};
+     alignas(64) std::atomic<bool> back_waiting{};
+     std::atomic<u32> wake{};
+     std::jthread back_thread;
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 55200b0647..3af8cb65a8 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -99,7 +99,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
+                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
+-                    split.DeferFunction(std::move(run->func));
++                    if (run->before_later_reads) {
++                        split.Drain();
++                        run->func();
++                    } else {
++                        split.DeferFunction(std::move(run->func));
++                    }
+                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
+                     split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
+                         rasterizer_ptr->FlushRegion(addr, size);
+@@ -155,8 +160,8 @@ void ThreadManager::TickGPU(bool is_async) {
+     PushCommand(GPUTickCommand(), false, is_async);
+ }
+ 
+-void ThreadManager::Run(std::function<void()>&& func, bool is_async) {
+-    PushCommand(RunCommand{std::move(func)}, false, is_async);
++void ThreadManager::Run(std::function<void()>&& func, bool is_async, bool before_later_reads) {
++    PushCommand(RunCommand{std::move(func), before_later_reads}, false, is_async);
+ }
+ 
+ void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
+diff --git a/src/video_core/gpu_thread.h b/src/video_core/gpu_thread.h
+index 796c0d89f6..927453dab0 100644
+--- a/src/video_core/gpu_thread.h
++++ b/src/video_core/gpu_thread.h
+@@ -80,6 +80,9 @@ struct GPUTickCommand final {};
+ /// Command to run a function on the GPU thread after the commands queued before it
+ struct RunCommand final {
+     std::function<void()> func;
++    /// With the GPU split, run on its front (after draining the back) instead of deferring to the
++    /// back, so command lists read after this one see what func did (GMMU maps).
++    bool before_later_reads{};
+ };
+ 
+ using CommandData =
+@@ -132,7 +135,7 @@ public:
+     void TickGPU(bool is_async);
+ 
+     /// Runs func on the GPU thread once the commands queued before it have been processed.
+-    void Run(std::function<void()>&& func, bool is_async);
++    void Run(std::function<void()>&& func, bool is_async, bool before_later_reads = false);
+ 
+     void NotifyShutdown();
+ 
+diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
+index db8c92adfd..92714d52d2 100644
+--- a/src/video_core/nx2.h
++++ b/src/video_core/nx2.h
+@@ -43,11 +43,43 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
+     }
+ }
+ 
++// GPU-written device pages the front has read command lists from (same layout as above). The
++// buffer cache copies these pages into host memory right after the compute or copy work that
++// writes them and submits, so the front reads the copy once the GPU is done instead of draining
++// the split and flushing the caches (BufferCache::Nx2ReadListCopy).
++inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_command_list_pages{};
++inline std::atomic<bool> g_nx2_has_command_list_pages{false};
++
++inline void Nx2MarkCommandListPage(u64 device_address) {
++    const u64 page = device_address >> Nx2WrittenPageBits;
++    if (page >= g_nx2_command_list_pages.size() * 64) {
++        return;
++    }
++    auto& word = g_nx2_command_list_pages[page / 64];
++    const u64 bit = u64{1} << (page % 64);
++    if ((word.load(std::memory_order_relaxed) & bit) == 0) {
++        word.fetch_or(bit, std::memory_order_relaxed);
++        g_nx2_has_command_list_pages.store(true, std::memory_order_relaxed);
++    }
++}
++
++[[nodiscard]] inline bool Nx2IsCommandListPage(u64 device_address) {
++    const u64 page = device_address >> Nx2WrittenPageBits;
++    if (page >= g_nx2_command_list_pages.size() * 64) {
++        return false;
++    }
++    return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
++}
++
+ /// A new emulation session starts: no page has been written by its GPU yet.
+ inline void Nx2ClearGpuWrittenPages() {
+     for (auto& word : g_nx2_gpu_written_pages) {
+         word.store(0, std::memory_order_relaxed);
+     }
++    for (auto& word : g_nx2_command_list_pages) {
++        word.store(0, std::memory_order_relaxed);
++    }
++    g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);
+ }
+ 
+ [[nodiscard]] inline bool Nx2IsGpuWritten(u64 device_address) {
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 8486d44ac9..e9eaa2b3c2 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -94,6 +94,20 @@ public:
+     virtual void FlushRegion(DAddr addr, u64 size,
+                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+ 
++    /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
++    enum class GpuWrittenList {
++        Unknown, ///< Neither: the caller drains, flushes the page and notes it synced
++        Copied,  ///< `out` (within one 4 KiB page) is filled from the copy made after its writer
++        Synced,  ///< Guest memory holds the page: no GPU work wrote it since it was flushed
++    };
++    virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
++                                                     [[maybe_unused]] std::span<u8> out) {
++        return GpuWrittenList::Unknown;
++    }
++
++    /// Switch 2: the front flushed this command list page with the split drained.
++    virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
++
+     /// Check if the the specified memory area requires flushing to CPU Memory.
+     virtual bool MustFlushRegion(DAddr addr, u64 size,
+                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+diff --git a/src/video_core/renderer_vulkan/vertex_repack.h b/src/video_core/renderer_vulkan/vertex_repack.h
+index b0849c25c7..456d1c6f20 100644
+--- a/src/video_core/renderer_vulkan/vertex_repack.h
++++ b/src/video_core/renderer_vulkan/vertex_repack.h
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
+@@ -31,8 +32,11 @@ struct VertexRepackParameters {
+     u32 dispatch_groups;
+ };
+ 
+-inline std::optional<VertexRepackParameters> MakeVertexRepackParameters(
+-    u32 offset, u32 size, u64 alignment, u64 max_storage_range, u32 max_dispatch_groups) {
++inline std::optional<VertexRepackParameters> MakeVertexRepackParameters(u32 offset, u32 size,
++                                                                        u64 alignment,
++                                                                        u64 max_storage_range,
++                                                                        u32 max_dispatch_groups,
++                                                                        u64 buffer_size) {
+     if (size == 0 || alignment == 0) {
+         return std::nullopt;
+     }
+@@ -40,9 +44,11 @@ inline std::optional<VertexRepackParameters> MakeVertexRepackParameters(
+     const u64 output_size = vertices * 72;
+     const u64 base = u64{offset} / alignment * alignment;
+     const u64 bias = offset - base;
+-    const u64 range = (bias + size + 3) / 4 * 4;
++    // The word-rounded range must not run past the end of the source buffer
++    const u64 available = buffer_size > base ? buffer_size - base : 0;
++    const u64 range = (std::min)((bias + size + 3) / 4 * 4, available);
+     const u64 groups = (vertices * 18 + 127) / 128;
+-    if (output_size > std::numeric_limits<u32>::max() ||
++    if (range < bias + size || output_size > std::numeric_limits<u32>::max() ||
+         range > std::numeric_limits<u32>::max() || output_size > max_storage_range ||
+         range > max_storage_range || groups > max_dispatch_groups) {
+         return std::nullopt;
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index fe0ab3a28e..4d5ccb6520 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -394,7 +394,7 @@ u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::R
+         LOG_DEBUG(Render_Vulkan, "Vertex repack selection: mask={:#x}, dynamic_input={}",
+                   vertex_repack_mask, dynamic_input);
+     }
+-    return old_mask | vertex_repack_mask;
++    return old_mask ^ vertex_repack_mask;
+ }
+ 
+ StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
+@@ -453,6 +453,10 @@ void BufferCacheRuntime::Wait(u64 tick) {
+     scheduler.Wait(tick);
+ }
+ 
++void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
++    scheduler.GetMasterSemaphore().Wait(tick);
++}
++
+ void BufferCacheRuntime::Finish() {
+     scheduler.Finish();
+ }
+@@ -653,7 +657,8 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
+         return;
+     }
+     if (buffer != VK_NULL_HANDLE && size != 0 && IsVertexRepacked(index)) {
+-        const auto repacked = vertex_repack_pass->Assemble(buffer, offset, size);
++        const auto repacked =
++            vertex_repack_pass->Assemble(buffer, offset, size, u64{offset} + size);
+         if (!repacked) {
+             return;
+         }
+@@ -698,7 +703,8 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
+         if (handle != VK_NULL_HANDLE && IsVertexRepacked(binding) && bindings.strides[i] == 69 &&
+             bindings.sizes[i] > 0) {
+             const auto repacked = vertex_repack_pass->Assemble(
+-                handle, static_cast<u32>(bindings.offsets[i]), static_cast<u32>(bindings.sizes[i]));
++                handle, static_cast<u32>(bindings.offsets[i]), static_cast<u32>(bindings.sizes[i]),
++                bindings.buffers[i]->SizeBytes());
+             if (!repacked) {
+                 continue;
+             }
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+index ff854445b5..a8d0274016 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -110,6 +110,7 @@ public:
+ 
+     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
+ 
++    /// Returns the mask of bindings whose repacked state changed.
+     u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
+ 
+     bool IsVertexRepacked(u32 binding) const {
+@@ -122,6 +123,9 @@ public:
+ 
+     void Wait(u64 tick);
+ 
++    /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
++    void WaitSubmittedTick(u64 tick);
++
+     void Finish();
+ 
+     u64 GetDeviceLocalMemory() const;
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pass.cpp b/src/video_core/renderer_vulkan/vk_compute_pass.cpp
+index cb8dcde42f..5902b7d8f5 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pass.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pass.cpp
+@@ -335,10 +335,11 @@ VertexRepackPass::VertexRepackPass(const Device& device_, Scheduler& scheduler_,
+       scheduler{scheduler_}, staging_pool{staging_pool_}, descriptor_queue{descriptor_queue_} {}
+ 
+ std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBuffer source,
+-                                                                           u32 offset, u32 size) {
++                                                                            u32 offset, u32 size,
++                                                                            u64 buffer_size) {
+     const auto parameters = MakeVertexRepackParameters(
+         offset, size, device.GetStorageBufferAlignment(), device.GetMaxStorageBufferRange(),
+-        device.GetMaxComputeWorkGroupCount()[0]);
++        device.GetMaxComputeWorkGroupCount()[0], buffer_size);
+     if (!parameters) {
+         LOG_ERROR(Render_Vulkan, "Vertex repack exceeds device limits: offset={}, size={}", offset, size);
+         return std::nullopt;
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pass.h b/src/video_core/renderer_vulkan/vk_compute_pass.h
+index 27fffbbbb7..9687bfff91 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pass.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pass.h
+@@ -60,9 +60,10 @@ class VertexRepackPass final : public ComputePass {
+ public:
+     VertexRepackPass(const Device& device, Scheduler& scheduler, DescriptorPool& descriptor_pool,
+                      StagingBufferPool& staging_pool, ComputePassDescriptorQueue& descriptor_queue);
+-    /// Returns nothing when the range exceeds the device limits; the binding is then left as is.
+-    std::optional<std::pair<VkBuffer, VkDeviceSize>> Assemble(VkBuffer source, u32 offset,
+-                                                              u32 size);
++    /// Returns nothing when the range exceeds the device limits or the source buffer; the binding
++    /// is then left as is.
++    std::optional<std::pair<VkBuffer, VkDeviceSize>> Assemble(VkBuffer source, u32 offset, u32 size,
++                                                              u64 buffer_size);
+ 
+ private:
+     Scheduler& scheduler;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index d3dbba6163..dc34260de5 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -922,6 +922,11 @@ void RasterizerVulkan::DispatchCompute() {
+         return;
+     }
+     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
++    // Command list pages the dispatch writes are copied for the split's front right after it.
++    buffer_cache.Nx2CollectListCopies(true);
++    SCOPE_EXIT {
++        buffer_cache.Nx2CollectListCopies(false);
++    };
+     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
+                              texture_cache)) {
+         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
+@@ -944,6 +949,7 @@ void RasterizerVulkan::DispatchCompute() {
+             }
+             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+         });
++        SubmitNx2ListCopies();
+         return;
+     }
+     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
+@@ -966,6 +972,7 @@ void RasterizerVulkan::DispatchCompute() {
+         }
+         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+     });
++    SubmitNx2ListCopies();
+ 
+     // Log compute dispatch
+     if (GPU::Logging::IsActive() &&
+@@ -1007,6 +1014,29 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
+ 
+ void RasterizerVulkan::FlushAll() {}
+ 
++void RasterizerVulkan::SubmitNx2ListCopies() {
++    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
++        scheduler.Flush();
++    }
++}
++
++VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenCommandList(
++    DAddr addr, std::span<u8> out) {
++    // No cache lock: the front only reads the copies, under their own lock.
++    switch (buffer_cache.Nx2ReadListCopy(addr, out)) {
++    case BufferCache::Nx2ListRead::Copied:
++        return GpuWrittenList::Copied;
++    case BufferCache::Nx2ListRead::Synced:
++        return GpuWrittenList::Synced;
++    default:
++        return GpuWrittenList::Unknown;
++    }
++}
++
++void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
++    buffer_cache.Nx2NoteListSynced(page);
++}
++
+ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+     if (addr == 0 || size == 0) {
+         return;
+@@ -1097,12 +1127,10 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+             buffer_cache.WriteMemory(addr, size);
+         }
+     }
+-    {
+-        for (const auto& [addr, size] : sequences) {
+-            query_cache.InvalidateRegion(addr, size);
+-            pipeline_cache.InvalidateRegion(addr, size);
+-        }
++    for (const auto& [addr, size] : sequences) {
++        query_cache.InvalidateRegion(addr, size);
+     }
++    pipeline_cache.InvalidateRegions(sequences);
+ }
+ 
+ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+@@ -1319,6 +1347,8 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
+     bool uploaded;
+     {
+         std::scoped_lock lock{buffer_cache.mutex};
++        // Guest memory has the words now: a command list copy of the page no longer does.
++        buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+         uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
+         if (!uploaded && !defer) {
+             buffer_cache.WriteMemory(*cpu_addr, copy_size);
+@@ -1414,7 +1444,13 @@ bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
+ 
+ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+     std::scoped_lock lock{buffer_cache.mutex};
+-    return buffer_cache.DMACopy(src_address, dest_address, amount);
++    buffer_cache.Nx2CollectListCopies(true);
++    const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
++    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
++        scheduler.Flush();
++    }
++    buffer_cache.Nx2CollectListCopies(false);
++    return copied;
+ }
+ 
+ template <bool IS_IMAGE_UPLOAD>
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index fc282fbe8d..dbb6ebdca8 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -99,6 +99,8 @@ public:
+     void FlushAll() override;
+     void FlushRegion(DAddr addr, u64 size,
+                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
++    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out) override;
++    void NoteGpuWrittenCommandListSynced(DAddr page) override;
+     bool MustFlushRegion(DAddr addr, u64 size,
+                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+@@ -165,6 +167,10 @@ private:
+ 
+     void FlushWork();
+ 
++    /// Records the copies of the command list pages the work just recorded wrote and submits, so
++    /// the GPU makes them now (BufferCache::Nx2CopyListPages).
++    void SubmitNx2ListCopies();
++
+     void UpdateDynamicStates();
+ 
+     void HandleTransformFeedback();
+diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
+index 5faed0dba9..5d41dc9697 100644
+--- a/src/video_core/shader_cache.cpp
++++ b/src/video_core/shader_cache.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <functional>
+ #include <string>
+ #include <unordered_set>
+ #include <fmt/ranges.h>
+@@ -36,6 +37,17 @@ void ShaderCache::InvalidateRegion(VAddr addr, size_t size) {
+     RemovePendingShaders();
+ }
+ 
++void ShaderCache::InvalidateRegions(std::span<const std::pair<DAddr, size_t>> sequences) {
++    if (sequences.empty()) {
++        return;
++    }
++    std::scoped_lock lock{invalidation_mutex};
++    for (const auto& [addr, size] : sequences) {
++        InvalidatePagesInRegion(addr, size);
++    }
++    RemovePendingShaders();
++}
++
+ void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
+     std::scoped_lock lock{invalidation_mutex};
+     InvalidatePagesInRegion(addr, size);
+@@ -304,10 +316,17 @@ void ShaderCache::RemovePendingShaders() {
+     marked_for_removal.clear();
+ 
+     if (!removed_shaders.empty()) {
+-        // Remove the given shaders from the cache
+-        std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
+-            return std::ranges::find(removed_shaders, shader.get()) != removed_shaders.end();
+-        });
++        if (removed_shaders.size() > 16) {
++            std::ranges::sort(removed_shaders, std::less<ShaderInfo*>{});
++            std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
++                return std::binary_search(removed_shaders.begin(), removed_shaders.end(),
++                                          shader.get(), std::less<ShaderInfo*>{});
++            });
++        } else {
++            std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
++                return std::ranges::find(removed_shaders, shader.get()) != removed_shaders.end();
++            });
++        }
+     }
+ }
+ 
+diff --git a/src/video_core/shader_cache.h b/src/video_core/shader_cache.h
+index 281a90cb6f..7c370e217c 100644
+--- a/src/video_core/shader_cache.h
++++ b/src/video_core/shader_cache.h
+@@ -67,6 +67,8 @@ public:
+     /// @param size Number of bytes of the invalidation
+     void InvalidateRegion(VAddr addr, size_t size);
+ 
++    void InvalidateRegions(std::span<const std::pair<DAddr, size_t>> sequences);
++
+     /// @brief Unmarks a memory region as cached and marks it for removal
+     /// @param addr Start address of the CPU write operation
+     /// @param size Number of bytes of the CPU write operation
+@@ -104,6 +106,8 @@ protected:
+     bool last_shaders_valid = false;
+ 
+ private:
++    friend struct ShaderCacheTestAccess;
++
+     /// @brief Tries to obtain a cached shader starting in a given address
+     /// @note Doesn't check for ranges, the given address has to be the start of the shader
+     /// @param addr Start address of the shader, this doesn't cache for region
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index 75383809c5..8d98e26be1 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -7,12 +7,14 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cstring>
+ #include <vector>
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
+ #include "common/div_ceil.h"
+ #include "common/assert.h"
++#include "core/memory.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/rasterizer_interface.h"
+ 
+@@ -43,7 +45,15 @@ public:
+         }
+         const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+         std::pair<T, bool> result;
+-        gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
++        // This runs for every texture and sampler of every draw. An entry within one page is
++        // contiguous in host memory, so a single page lookup replaces the generic block read.
++        const bool one_page =
++            (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
++        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
++            std::memcpy(std::addressof(result.first), host, sizeof(T));
++        } else {
++            gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
++        }
+         if ((read_descriptors[index / 64] & (1ULL << (index % 64))) != 0) {
+             result.second = result.first != descriptors[index];
+         } else {
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index 3f3ae9c..8b880e1 100644
+index 3f3ae9cafd..30e5e51f00 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
 @@ -251,7 +251,12 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
@@ -16,8 +2456,26 @@ index 3f3ae9c..8b880e1 100644
      expected_memory =
          (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
      minimum_memory =
+@@ -580,7 +585,7 @@ template <class P>
+ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
+     auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
+     if (index > table.current_limit) {
+-        LOG_DEBUG(HW_GPU, "Invalid sampler index={}", index);
++        LOG_TRACE(HW_GPU, "Invalid sampler index={}", index);
+         return NULL_SAMPLER_ID;
+     }
+     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
+@@ -811,7 +816,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+     auto& table = compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
+     index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit);
+     if (index > table.current_limit) {
+-        LOG_DEBUG(HW_GPU, "Invalid image view index={}", index);
++        LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
+         return NULL_IMAGE_VIEW_ID;
+     }
+     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
 diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
-index 01e13cb..1a42d61 100644
+index 01e13cb384..1a42d61912 100644
 --- a/src/video_core/vulkan_common/vulkan_device.cpp
 +++ b/src/video_core/vulkan_common/vulkan_device.cpp
 @@ -1784,7 +1784,10 @@ void Device::CollectPhysicalMemoryInfo() {
