@@ -353,6 +353,170 @@ index 37c797fa3f..c23bfbba4e 100644
      }
  
      // Shows a presented native image: word 5 is the image id, ~word 22 / word 24 the GPU fence
+diff --git a/src/core/loader/deconstructed_rom_directory.cpp b/src/core/loader/deconstructed_rom_directory.cpp
+index 04b05d188f..f67e0d6b0d 100644
+--- a/src/core/loader/deconstructed_rom_directory.cpp
++++ b/src/core/loader/deconstructed_rom_directory.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <map>
+ #include <memory>
+@@ -20,6 +22,7 @@
+ #include "core/file_sys/patch_manager.h"
+ #include "core/file_sys/romfs.h"
+ #include "core/file_sys/romfs_factory.h"
++#include "core/file_sys/vfs/vfs_layered.h"
+ #include "core/hle/kernel/k_page_table.h"
+ #include "core/hle/kernel/k_process.h"
+ #include "core/hle/service/filesystem/filesystem.h"
+@@ -80,8 +83,97 @@ struct PatchCollection {
+ 
+ namespace {
+ 
++FileSys::VirtualDir FindLooseRomFSDirectory(const FileSys::VirtualDir& parent) {
++    if (parent == nullptr) {
++        return nullptr;
++    }
++    if (const auto dir = parent->GetSubdirectory("romfs")) {
++        return dir;
++    }
++    for (const auto& dir : parent->GetSubdirectories()) {
++        const auto name = dir->GetName();
++        if (name.size() == 5 && std::equal(name.begin(), name.end(), "romfs", [](char a, char b) {
++                return std::tolower(static_cast<unsigned char>(a)) == b;
++            })) {
++            return dir;
++        }
++    }
++    return nullptr;
++}
++
++FileSys::VirtualDir FindSubdirectoryCaseless(const FileSys::VirtualDir& parent,
++                                             std::string_view name) {
++    if (parent == nullptr) {
++        return nullptr;
++    }
++    for (const auto& dir : parent->GetSubdirectories()) {
++        const auto& dir_name = dir->GetName();
++        if (dir_name.size() == name.size() &&
++            std::equal(dir_name.begin(), dir_name.end(), name.begin(), [](char a, char b) {
++                return std::tolower(static_cast<unsigned char>(a)) == b;
++            })) {
++            return dir;
++        }
++    }
++    return nullptr;
++}
++
++// The RomFS directories of a <game>/base/exefs or <game>/updates/<version>/exefs dump, newest
++// update first and base last, when there is more than one: an extracted update RomFS carries only
++// the files the update adds or changes (Mario Kart World 1.8.0's new cups, Donkey Kong Bananza's
++// System/HeapSize), so it has to be layered over the base RomFS.
++std::vector<FileSys::VirtualDir> FindLooseRomFSLayers(const FileSys::VirtualDir& exefs_dir) {
++    const auto parent = exefs_dir->GetParentDirectory();
++    if (parent == nullptr) {
++        return {};
++    }
++    const auto is_named = [](const FileSys::VirtualDir& dir, std::string_view name) {
++        const auto& dir_name = dir->GetName();
++        return dir_name.size() == name.size() &&
++               std::equal(dir_name.begin(), dir_name.end(), name.begin(), [](char a, char b) {
++                   return std::tolower(static_cast<unsigned char>(a)) == b;
++               });
++    };
++    // <game>/base/exefs, or <game>/updates/<version>/exefs.
++    FileSys::VirtualDir root;
++    if (const auto above = parent->GetParentDirectory()) {
++        if (is_named(parent, "base")) {
++            root = above;
++        } else if (is_named(above, "updates")) {
++            root = above->GetParentDirectory();
++        }
++    }
++    const auto updates_dir = FindSubdirectoryCaseless(root, "updates");
++    if (updates_dir == nullptr) {
++        return {};
++    }
++    std::vector<std::pair<u64, FileSys::VirtualDir>> updates;
++    for (const auto& dir : updates_dir->GetSubdirectories()) {
++        const auto& name = dir->GetName();
++        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) {
++            continue;
++        }
++        if (const auto romfs = FindLooseRomFSDirectory(dir)) {
++            updates.emplace_back(std::strtoull(name.c_str(), nullptr, 10), romfs);
++        }
++    }
++    std::ranges::sort(updates, [](const auto& a, const auto& b) { return a.first > b.first; });
++    std::vector<FileSys::VirtualDir> layers;
++    for (const auto& [version, romfs] : updates) {
++        layers.push_back(romfs);
++    }
++    if (const auto base = FindLooseRomFSDirectory(FindSubdirectoryCaseless(root, "base"))) {
++        layers.push_back(base);
++    }
++    if (layers.size() < 2) {
++        return {};
++    }
++    return layers;
++}
++
+ // RomFS for a loose ExeFS: the first .romfs file next to main, else a romfs/ directory next to
+-// the exefs/ directory (the usual layout of an extracted title).
++// the exefs/ directory (the usual layout of an extracted title), with update RomFS directories
++// layered over the base one (FindLooseRomFSLayers).
+ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
+     if (exefs_dir == nullptr) {
+         return nullptr;
+@@ -91,8 +183,33 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
+             return f;
+         }
+     }
++    if (auto layers = FindLooseRomFSLayers(exefs_dir); !layers.empty()) {
++        static std::mutex cache_mutex;
++        static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
++        std::string key;
++        for (const auto& layer : layers) {
++            key += layer->GetFullPath() + '|';
++        }
++        std::scoped_lock lk{cache_mutex};
++        auto& cached = cache[key];
++        if (auto built = cached.lock()) {
++            return built;
++        }
++        for (const auto& layer : layers) {
++            LOG_INFO(Loader, "Loose RomFS layer: {}", layer->GetFullPath());
++        }
++        const auto started = std::chrono::steady_clock::now();
++        auto built = FileSys::CreateRomFS(
++            FileSys::LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers)));
++        LOG_INFO(Loader, "Layered loose RomFS image ready: elapsed_ms={}",
++                 std::chrono::duration_cast<std::chrono::milliseconds>(
++                     std::chrono::steady_clock::now() - started)
++                     .count());
++        cached = built;
++        return built;
++    }
+     if (const auto parent = exefs_dir->GetParentDirectory()) {
+-        if (const auto romfs_dir = parent->GetSubdirectory("romfs")) {
++        if (const auto romfs_dir = FindLooseRomFSDirectory(parent)) {
+             // Building it walks every file and keeps an object for each (title 1: 206k files, ~150
+             // MiB), so loaders of the same directory share one build while any of them holds it.
+             static std::mutex cache_mutex;
+@@ -249,7 +366,7 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
+ 
+     romfs_exefs_dir = file_dir;
+     if (const auto title_dir = file_dir->GetParentDirectory()) {
+-        romfs_version = RomFSProductVersion(title_dir->GetSubdirectory("romfs"));
++        romfs_version = RomFSProductVersion(FindLooseRomFSDirectory(title_dir));
+     }
+ }
+ 
 diff --git a/src/core/loader/nso.cpp b/src/core/loader/nso.cpp
 index 7e3b9a54c2..0a8fce7958 100644
 --- a/src/core/loader/nso.cpp
@@ -537,6 +701,30 @@ index 0000000000..d8f242085c
 +        REQUIRE(expected == live.end());
 +    }
 +}
+diff --git a/src/tests/core/nup_writer.cpp b/src/tests/core/nup_writer.cpp
+index ce1a0717ed..ff13dc71cf 100644
+--- a/src/tests/core/nup_writer.cpp
++++ b/src/tests/core/nup_writer.cpp
+@@ -197,9 +197,11 @@ TEST_CASE("NUP packs base, updates and add-ons and reads back through NupContain
+     REQUIRE(packages[0].kind == NupContainer::PackageKind::Base);
+     REQUIRE(packages[0].title_id == TitleId);
+     REQUIRE(packages[0].version == 0);
++    REQUIRE(packages[0].display_version == "1.0.0");
+     REQUIRE(packages[0].npdm.size() == 0x100);
+     REQUIRE(packages[1].kind == NupContainer::PackageKind::Update);
+     REQUIRE(packages[1].version == 65536);
++    REQUIRE(packages[1].display_version == "1.1.0");
+     REQUIRE(packages[1].title_id == TitleId);
+     REQUIRE_FALSE(packages[1].standalone_update);
+     REQUIRE(packages[2].kind == NupContainer::PackageKind::Update);
+@@ -388,5 +390,6 @@ TEST_CASE("NUP output is reproducible", "[nup]") {
+     for (const u8 b : Sha256(ReadAll(archive))) {
+         hex += fmt::format("{:02x}", b);
+     }
+-    REQUIRE(hex == "df8446903ab2c39a51af0304935eb4aa5d8ead105440976ceae7ab97133f6143");
++    // The mixed-case Base/RomFS directory supplies base version 1.0.0 on every platform.
++    REQUIRE(hex == "718231e0974ca04c7be7bd6ed4334015b777c6e5f1ed51de23f899f81ee004ab");
+ }
 diff --git a/src/tests/core/priority_queue.cpp b/src/tests/core/priority_queue.cpp
 new file mode 100644
 index 0000000000..0d7174f793
