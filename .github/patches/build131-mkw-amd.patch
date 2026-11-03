@@ -2471,10 +2471,31 @@ index 27fffbbbb7..9687bfff91 100644
  private:
      Scheduler& scheduler;
 diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
-index ff8e84b019..5c0b9d58cc 100644
+index ff8e84b019..f91c1a88dd 100644
 --- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
-@@ -1011,6 +1011,14 @@ void PipelineCache::EvictUnusedPipelines() {
+@@ -742,15 +742,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
+         return;
+     }
+-    pipeline_cache_filename = base_dir / "vulkan.bin";
+-    used_pipelines_filename = base_dir / "vulkan_used.bin";
++    // Its own files: build131 and the latest builds use different cache versions, and each
++    // deletes a cache file of the other version.
++    pipeline_cache_filename = base_dir / "vulkan_b131.bin";
++    used_pipelines_filename = base_dir / "vulkan_b131_used.bin";
+     used_pipelines = LoadUsedPipelines(used_pipelines_filename);
+     used_pipelines_saved = std::chrono::steady_clock::now();
+     size_t skipped_pipelines = 0;
+     size_t queued_graphics = 0;
+ 
+     if (use_vulkan_pipeline_cache) {
+-        vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
++        vulkan_pipeline_cache_filename = base_dir / "vulkan_b131_pipelines.bin";
+         vulkan_pipeline_cache =
+             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
+     }
+@@ -1011,6 +1013,14 @@ void PipelineCache::EvictUnusedPipelines() {
      if (frame_count <= EvictAfterFrames) {
          return;
      }
