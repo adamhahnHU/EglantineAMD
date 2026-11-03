@@ -194,7 +194,9 @@ jobs:
           Mario Kart World build for a Ryzen 7000 (Zen 4) CPU and an AMD Radeon GPU, from ${GITHUB_SHA}.
 
           - \`latest\`: this branch, with the newest upstream changes.
-          - \`build131\`: upstream build 131 (ce1b1de) plus the later upstream performance commits that don't touch textures, the VRAM and texture cache fixes, and dynamic FPS.
+          - \`build131\` (recommended): upstream build 131 (ce1b1de) plus the later upstream performance commits that don't touch textures, the VRAM and texture cache fixes, MKW 1.8.0 boot support and dynamic FPS.
+
+          Dynamic FPS keeps Mario Kart World at normal speed below 60 fps. It is on by default; turn it off under Graphics > Advanced if the game misbehaves.
 
           Extract a zip and run \`eglantine.exe\`. Built with MinGW clang, Eden's PGO profile and
           \`-march=znver4\`: it needs a CPU with AVX-512 (Ryzen 7000/9000) and will not start on older ones.
