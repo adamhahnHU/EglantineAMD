@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <atomic>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <utility>
 
 #include "game_settings.h"
@@ -115,7 +117,29 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
     return vfs->OpenFile(path, FileSys::OpenMode::Read);
 }
 
+#ifndef _WIN32
+extern char** environ;
+#endif
+
 namespace {
+
+// The EDEN_NX2_* knobs this process sees, so a log shows whether a launcher's variables arrived.
+void LogNx2EnvironmentVariables() {
+#ifdef _WIN32
+    char** const env = _environ;
+#else
+    char** const env = environ;
+#endif
+    std::string knobs;
+    for (char** entry = env; entry != nullptr && *entry != nullptr; ++entry) {
+        const std::string_view variable{*entry};
+        if (variable.starts_with("EDEN_NX2_")) {
+            knobs += knobs.empty() ? "" : " ";
+            knobs += variable;
+        }
+    }
+    LOG_INFO(Core, "Switch 2 knobs set: {}", knobs.empty() ? "none" : knobs);
+}
 
 // Detect the platform before initializing the kernel memory layout and guest clock.
 bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
@@ -415,6 +439,7 @@ struct System::Impl {
         }
 
         LOG_INFO(Core, "Loading {} ({:016X}) ...", name, params.program_id);
+        LogNx2EnvironmentVariables();
 
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);
