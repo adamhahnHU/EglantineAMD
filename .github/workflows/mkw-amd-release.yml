@@ -14,6 +14,7 @@ on:
       - "externals/**"
       - "dist/**"
       - "cpmfile.json"
+      - ".github/patches/**"
       - ".github/workflows/mkw-amd-release.yml"
 
 permissions:
@@ -24,15 +25,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # latest: this branch. build131: upstream build 131 (ce1b1de), whose textures render correctly
+  # on AMD, with this branch's memory fixes applied as a patch.
   build:
-    name: windows-x86_64-zen4 binary
+    name: windows-x86_64-zen4 ${{ matrix.variant }}
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [latest, build131]
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 3000M
     steps:
       - name: Check out source
         uses: actions/checkout@v5
+
+      - name: Switch to build 131
+        if: matrix.variant == 'build131'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/patches/build131-mkw-amd.patch "$RUNNER_TEMP/"
+          git fetch --depth=1 origin ce1b1de6f1beed36958368f89cda466937ff9716
+          git checkout -q FETCH_HEAD
+          git apply "$RUNNER_TEMP/build131-mkw-amd.patch"
+          git status --short
 
       - name: Download PGO profile
         shell: bash
@@ -70,9 +88,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .ccache
-          key: objects-windows-x86_64-zen4-${{ github.sha }}
+          key: objects-windows-x86_64-zen4-${{ matrix.variant }}-${{ github.sha }}
           restore-keys: |
-            objects-windows-x86_64-zen4-
+            objects-windows-x86_64-zen4-${{ matrix.variant }}-
 
       - name: Configure
         shell: msys2 {0}
@@ -139,13 +157,13 @@ jobs:
           find . -name '*.dll' | while read -r dll; do
             deps "$dll"
           done
-          zip -qr "$GITHUB_WORKSPACE/eglantine-mkw-amd-windows-zen4.zip" .
+          zip -qr "$GITHUB_WORKSPACE/eglantine-mkw-amd-windows-zen4-${{ matrix.variant }}.zip" .
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: eglantine-mkw-amd-windows-zen4-${{ github.sha }}
-          path: eglantine-mkw-amd-windows-zen4.zip
+          name: eglantine-mkw-amd-windows-zen4-${{ matrix.variant }}-${{ github.sha }}
+          path: eglantine-mkw-amd-windows-zen4-${{ matrix.variant }}.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -157,10 +175,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download binary
+      - name: Download binaries
         uses: actions/download-artifact@v7
         with:
-          name: eglantine-mkw-amd-windows-zen4-${{ github.sha }}
+          pattern: eglantine-mkw-amd-windows-zen4-*-${{ github.sha }}
+          merge-multiple: true
           path: dist
 
       - name: Create release
@@ -173,7 +192,10 @@ jobs:
           cat > notes.md <<EOF
           Mario Kart World build for a Ryzen 7000 (Zen 4) CPU and an AMD Radeon GPU, from ${GITHUB_SHA}.
 
-          Extract the zip and run \`eglantine.exe\`. Built with MinGW clang, Eden's PGO profile and
+          - \`latest\`: this branch, with the newest upstream changes.
+          - \`build131\`: upstream build 131 (ce1b1de) with this branch's VRAM and texture cache fixes.
+
+          Extract a zip and run \`eglantine.exe\`. Built with MinGW clang, Eden's PGO profile and
           \`-march=znver4\`: it needs a CPU with AVX-512 (Ryzen 7000/9000) and will not start on older ones.
           EOF
           gh release create "${tag}" dist/* \

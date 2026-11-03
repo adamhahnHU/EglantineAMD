@@ -1,0 +1,34 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 3f3ae9c..8b880e1 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -251,7 +251,12 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
+     // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
+     // MaxCriticalMemory on rather than near the card's budget.
+-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
++    // Cards with plenty of memory (24 GB) keep half of it, so they don't re-decode evicted ASTC.
++    u64 max_critical = MaxCriticalMemory;
++    if constexpr (HAS_DEVICE_MEMORY_INFO) {
++        max_critical = (std::max)(max_critical, runtime.GetDeviceLocalMemory() / 2);
++    }
++    critical_memory = (std::min)(critical_memory, max_critical);
+     expected_memory =
+         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+     minimum_memory =
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 01e13cb..1a42d61 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -1784,7 +1784,10 @@ void Device::CollectPhysicalMemoryInfo() {
+     } else {
+         const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
+         device_access_memory -= reserve_memory;
+-        if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive) {
++        // Cards with 16 GB or more keep their budget: Switch 2 titles need more than the cap, and
++        // capping a 24 GB card at 7 GB made the texture cache evict and re-decode constantly.
++        if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive &&
++            local_memory < 16_GiB) {
+             // Account for resolution scaling in memory limits
+             const size_t normal_memory = 6_GiB;
+             const size_t scaler_memory = 1_GiB * Settings::values.resolution_info.ScaleUp(1);
