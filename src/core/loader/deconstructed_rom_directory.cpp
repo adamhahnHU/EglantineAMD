@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -21,6 +22,7 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
+#include "core/file_sys/vfs/vfs_layered.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -99,8 +101,79 @@ FileSys::VirtualDir FindLooseRomFSDirectory(const FileSys::VirtualDir& parent) {
     return nullptr;
 }
 
+FileSys::VirtualDir FindSubdirectoryCaseless(const FileSys::VirtualDir& parent,
+                                             std::string_view name) {
+    if (parent == nullptr) {
+        return nullptr;
+    }
+    for (const auto& dir : parent->GetSubdirectories()) {
+        const auto& dir_name = dir->GetName();
+        if (dir_name.size() == name.size() &&
+            std::equal(dir_name.begin(), dir_name.end(), name.begin(), [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == b;
+            })) {
+            return dir;
+        }
+    }
+    return nullptr;
+}
+
+// The RomFS directories of a <game>/base/exefs or <game>/updates/<version>/exefs dump, newest
+// update first and base last, when there is more than one: an extracted update RomFS carries only
+// the files the update adds or changes (Mario Kart World 1.8.0's new cups, Donkey Kong Bananza's
+// System/HeapSize), so it has to be layered over the base RomFS.
+std::vector<FileSys::VirtualDir> FindLooseRomFSLayers(const FileSys::VirtualDir& exefs_dir) {
+    const auto parent = exefs_dir->GetParentDirectory();
+    if (parent == nullptr) {
+        return {};
+    }
+    const auto is_named = [](const FileSys::VirtualDir& dir, std::string_view name) {
+        const auto& dir_name = dir->GetName();
+        return dir_name.size() == name.size() &&
+               std::equal(dir_name.begin(), dir_name.end(), name.begin(), [](char a, char b) {
+                   return std::tolower(static_cast<unsigned char>(a)) == b;
+               });
+    };
+    // <game>/base/exefs, or <game>/updates/<version>/exefs.
+    FileSys::VirtualDir root;
+    if (const auto above = parent->GetParentDirectory()) {
+        if (is_named(parent, "base")) {
+            root = above;
+        } else if (is_named(above, "updates")) {
+            root = above->GetParentDirectory();
+        }
+    }
+    const auto updates_dir = FindSubdirectoryCaseless(root, "updates");
+    if (updates_dir == nullptr) {
+        return {};
+    }
+    std::vector<std::pair<u64, FileSys::VirtualDir>> updates;
+    for (const auto& dir : updates_dir->GetSubdirectories()) {
+        const auto& name = dir->GetName();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) {
+            continue;
+        }
+        if (const auto romfs = FindLooseRomFSDirectory(dir)) {
+            updates.emplace_back(std::strtoull(name.c_str(), nullptr, 10), romfs);
+        }
+    }
+    std::ranges::sort(updates, [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<FileSys::VirtualDir> layers;
+    for (const auto& [version, romfs] : updates) {
+        layers.push_back(romfs);
+    }
+    if (const auto base = FindLooseRomFSDirectory(FindSubdirectoryCaseless(root, "base"))) {
+        layers.push_back(base);
+    }
+    if (layers.size() < 2) {
+        return {};
+    }
+    return layers;
+}
+
 // RomFS for a loose ExeFS: the first .romfs file next to main, else a romfs/ directory next to
-// the exefs/ directory (the usual layout of an extracted title).
+// the exefs/ directory (the usual layout of an extracted title), with update RomFS directories
+// layered over the base one (FindLooseRomFSLayers).
 FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
     if (exefs_dir == nullptr) {
         return nullptr;
@@ -109,6 +182,31 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
         if (f->GetExtension() == "romfs") {
             return f;
         }
+    }
+    if (auto layers = FindLooseRomFSLayers(exefs_dir); !layers.empty()) {
+        static std::mutex cache_mutex;
+        static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
+        std::string key;
+        for (const auto& layer : layers) {
+            key += layer->GetFullPath() + '|';
+        }
+        std::scoped_lock lk{cache_mutex};
+        auto& cached = cache[key];
+        if (auto built = cached.lock()) {
+            return built;
+        }
+        for (const auto& layer : layers) {
+            LOG_INFO(Loader, "Loose RomFS layer: {}", layer->GetFullPath());
+        }
+        const auto started = std::chrono::steady_clock::now();
+        auto built = FileSys::CreateRomFS(
+            FileSys::LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers)));
+        LOG_INFO(Loader, "Layered loose RomFS image ready: elapsed_ms={}",
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count());
+        cached = built;
+        return built;
     }
     if (const auto parent = exefs_dir->GetParentDirectory()) {
         if (const auto romfs_dir = FindLooseRomFSDirectory(parent)) {
