@@ -251,10 +251,14 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
     // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
     // MaxCriticalMemory on rather than near the card's budget.
-    // Cards with plenty of memory (24 GB) keep half of it, so they don't re-decode evicted ASTC.
+    // Cards of 16 GB and more keep all but 4 GiB: a Knockout Tour streams most of title 1's world,
+    // and capped at half of a 24 GB card it evicted thousands of decoded ASTC textures a minute.
     u64 max_critical = MaxCriticalMemory;
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
-        max_critical = (std::max)(max_critical, runtime.GetDeviceLocalMemory() / 2);
+        const u64 device_local = runtime.GetDeviceLocalMemory();
+        if (device_local >= 16_GiB) {
+            max_critical = (std::max)(max_critical, device_local - 4_GiB);
+        }
     }
     critical_memory = (std::min)(critical_memory, max_critical);
     expected_memory =

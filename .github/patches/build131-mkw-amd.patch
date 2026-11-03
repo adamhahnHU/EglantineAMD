@@ -2707,24 +2707,28 @@ index 75383809c5..8d98e26be1 100644
              result.second = result.first != descriptors[index];
          } else {
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index 3f3ae9cafd..30e5e51f00 100644
+index 3f3ae9cafd..babe98b597 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
-@@ -251,7 +251,12 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+@@ -251,7 +251,16 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
      // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
      // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
      // MaxCriticalMemory on rather than near the card's budget.
 -    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
-+    // Cards with plenty of memory (24 GB) keep half of it, so they don't re-decode evicted ASTC.
++    // Cards of 16 GB and more keep all but 4 GiB: a Knockout Tour streams most of title 1's world,
++    // and capped at half of a 24 GB card it evicted thousands of decoded ASTC textures a minute.
 +    u64 max_critical = MaxCriticalMemory;
 +    if constexpr (HAS_DEVICE_MEMORY_INFO) {
-+        max_critical = (std::max)(max_critical, runtime.GetDeviceLocalMemory() / 2);
++        const u64 device_local = runtime.GetDeviceLocalMemory();
++        if (device_local >= 16_GiB) {
++            max_critical = (std::max)(max_critical, device_local - 4_GiB);
++        }
 +    }
 +    critical_memory = (std::min)(critical_memory, max_critical);
      expected_memory =
          (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
      minimum_memory =
-@@ -580,7 +585,7 @@ template <class P>
+@@ -580,7 +589,7 @@ template <class P>
  SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
      auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
      if (index > table.current_limit) {
@@ -2733,7 +2737,7 @@ index 3f3ae9cafd..30e5e51f00 100644
          return NULL_SAMPLER_ID;
      }
      auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
-@@ -811,7 +816,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+@@ -811,7 +820,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
      auto& table = compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
      index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit);
      if (index > table.current_limit) {
