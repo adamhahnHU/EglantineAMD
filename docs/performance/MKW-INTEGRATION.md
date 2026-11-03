@@ -25,7 +25,7 @@ Adapted from [Selevet performance build 4](https://github.com/sylvieistaken/sele
   bitsets retain the generic traversal. The slot iterator also handles an empty
   first bitmap word correctly.
 
-Handheld mode, ScaleForce, and FXAA are the defaults. Explicit saved preferences
+Docked mode, ScaleForce, and FXAA are the defaults. Explicit saved preferences
 are retained. Accepting the startup recommendations saves the requested settings
 and reapplies the MKW preset after per-game configuration is loaded. Declining or
 closing the prompt preserves the user's settings.
