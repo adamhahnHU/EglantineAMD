@@ -1784,7 +1784,10 @@ void Device::CollectPhysicalMemoryInfo() {
     } else {
         const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
         device_access_memory -= reserve_memory;
-        if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive) {
+        // Cards with 16 GB or more keep their budget: Switch 2 titles need more than the cap, and
+        // capping a 24 GB card at 7 GB made the texture cache evict and re-decode constantly.
+        if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive &&
+            local_memory < 16_GiB) {
             // Account for resolution scaling in memory limits
             const size_t normal_memory = 6_GiB;
             const size_t scaler_memory = 1_GiB * Settings::values.resolution_info.ScaleUp(1);
