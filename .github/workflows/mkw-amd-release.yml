@@ -14,7 +14,6 @@ on:
       - "externals/**"
       - "dist/**"
       - "cpmfile.json"
-      - ".github/patches/**"
       - ".github/workflows/mkw-amd-release.yml"
 
 permissions:
@@ -25,33 +24,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # latest: this branch. build131: upstream build 131 (ce1b1de), whose textures render correctly
-  # on AMD, with .github/patches/build131-mkw-amd.patch applied (later performance commits that
-  # don't touch textures, the memory fixes and dynamic FPS).
   build:
     name: windows-x86_64-zen4 ${{ matrix.variant }}
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
-        variant: [latest, build131]
+        variant: [latest]
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 3000M
     steps:
       - name: Check out source
         uses: actions/checkout@v5
-
-      - name: Switch to build 131
-        if: matrix.variant == 'build131'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cp .github/patches/build131-mkw-amd.patch "$RUNNER_TEMP/"
-          git fetch --depth=1 origin ce1b1de6f1beed36958368f89cda466937ff9716
-          git checkout -q FETCH_HEAD
-          git apply "$RUNNER_TEMP/build131-mkw-amd.patch"
-          git status --short
 
       - name: Download PGO profile
         shell: bash
@@ -194,7 +179,6 @@ jobs:
           Mario Kart World build for a Ryzen 7000 (Zen 4) CPU and an AMD Radeon GPU, from ${GITHUB_SHA}.
 
           - \`latest\`: this branch, with the newest upstream changes.
-          - \`build131\` (recommended): upstream build 131 (ce1b1de) plus the later upstream performance commits that don't touch textures, the VRAM and texture cache fixes, MKW 1.8.0 boot support and dynamic FPS.
 
           Dynamic FPS keeps Mario Kart World at normal speed below 60 fps. It is on by default; turn it off under Graphics > Advanced if the game misbehaves.
 
