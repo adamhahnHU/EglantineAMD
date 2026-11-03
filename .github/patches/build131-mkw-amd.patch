@@ -2707,10 +2707,10 @@ index 75383809c5..8d98e26be1 100644
              result.second = result.first != descriptors[index];
          } else {
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index 3f3ae9cafd..babe98b597 100644
+index 3f3ae9cafd..7eca7335b2 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
-@@ -251,7 +251,16 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+@@ -251,9 +251,27 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
      // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
      // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
      // MaxCriticalMemory on rather than near the card's budget.
@@ -2725,10 +2725,22 @@ index 3f3ae9cafd..babe98b597 100644
 +        }
 +    }
 +    critical_memory = (std::min)(critical_memory, max_critical);
++    // Past expected the collector also evicts decoded ASTC unused for old_age frames (the world
++    // behind the kart); past critical, any unused for 10 frames, which are decoded again at once.
++    // 768 MiB between them crossed that band in seconds on a Knockout Tour: keep 4 GiB on 16 GB+.
++    u64 band = 768_MiB;
++    if constexpr (HAS_DEVICE_MEMORY_INFO) {
++        if (runtime.GetDeviceLocalMemory() >= 16_GiB) {
++            band = 4_GiB;
++        }
++    }
      expected_memory =
-         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+-        (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
++        (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, band));
      minimum_memory =
-@@ -580,7 +589,7 @@ template <class P>
+         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
+     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
+@@ -580,7 +598,7 @@ template <class P>
  SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
      auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
      if (index > table.current_limit) {
@@ -2737,7 +2749,7 @@ index 3f3ae9cafd..babe98b597 100644
          return NULL_SAMPLER_ID;
      }
      auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
-@@ -811,7 +820,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+@@ -811,7 +829,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
      auto& table = compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
      index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit);
      if (index > table.current_limit) {

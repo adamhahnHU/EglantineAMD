@@ -261,8 +261,17 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         }
     }
     critical_memory = (std::min)(critical_memory, max_critical);
+    // Past expected the collector also evicts decoded ASTC unused for old_age frames (the world
+    // behind the kart); past critical, any unused for 10 frames, which are decoded again at once.
+    // 768 MiB between them crossed that band in seconds on a Knockout Tour: keep 4 GiB on 16 GB+.
+    u64 band = 768_MiB;
+    if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        if (runtime.GetDeviceLocalMemory() >= 16_GiB) {
+            band = 4_GiB;
+        }
+    }
     expected_memory =
-        (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+        (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, band));
     minimum_memory =
         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
