@@ -201,6 +201,20 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     return layer_uploads && size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
 }
 
+// AMD can't sample unbound sparse memory (a855e8373f) and allocates at most 4 GB at once, so a
+// layered color image too big for one allocation (title 1's 8192x8192x68 BC6H terrain array,
+// ~6 GB, black when left unbacked) is made sparse with every layer bound.
+[[nodiscard]] bool UsesBoundSparseLayers(const Device& device, const ImageInfo& info) {
+    if (device.CanUseUnbackedSparseImages() || !device.IsSparseResidencyImage2DSupported() ||
+        info.type != ImageType::e2D || info.resources.layers <= 1 || info.num_samples != 1 ||
+        VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
+        return false;
+    }
+    return IsHugeAstcArray(device, info) ||
+           (!IsPixelFormatASTC(info.format) &&
+            (!IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported()));
+}
+
 // How SparseTiles images leave the blocks without data: unbound (reads give zero), or all bound to
 // one zeroed block where the driver can't sample unbound memory (AMD) but lets blocks share
 // memory. EDEN_NX2_SPARSE_ALIASED=1 takes the shared block wherever it is supported, =0 never.
@@ -276,8 +290,12 @@ enum class SparseTilesMode {
 // The most device memory one SparseLayers image binds: 768 MiB, 384 MiB on GPUs with less than
 // 7 GiB (title 1's BC6H arrays are 85 MB a layer).
 [[nodiscard]] VkDeviceSize SparseLayersCap(const Device& device) {
-    return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (VkDeviceSize{384} << 20)
-                                                           : (VkDeviceSize{768} << 20);
+    const u64 memory = device.GetDeviceLocalMemory();
+    if (memory >= (u64{16} << 30)) {
+        // Room for a fully bound terrain array (UsesBoundSparseLayers).
+        return memory / 3;
+    }
+    return memory < (u64{7} << 30) ? (VkDeviceSize{384} << 20) : (VkDeviceSize{768} << 20);
 }
 
 // The host format of a huge ASTC array: the GPU decoder's RGBA8 (sRGB kept for sampling).
@@ -2549,6 +2567,26 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
             original_image = MakeHostImage(runtime_, info, host_level_offset, gpu_addr_, true);
             if (!original_image.IsUnbacked()) {
                 flags &= ~VideoCommon::ImageFlagBits::Unbacked;
+            }
+        } else if (UsesBoundSparseLayers(runtime_.device, info) && InitSparseLayers()) {
+            std::vector<u32> layers(static_cast<size_t>(info.resources.layers));
+            std::iota(layers.begin(), layers.end(), 0U);
+            if (BindLayers(layers).size() == layers.size()) {
+                flags |= VideoCommon::ImageFlagBits::SparseLayers;
+                // Unwritten layers read zero, as on the console (compressed formats can't be
+                // cleared; their memory is fresh from the driver).
+                if (!IsPixelFormatASTC(info.format) && !IsPixelFormatBCn(info.format)) {
+                    ClearTiles();
+                }
+                LOG_INFO(Render_Vulkan, "Sparse layered image {:#x}: every layer bound ({} MiB)",
+                         gpu_addr_, sparse_layers.bound_bytes >> 20);
+            } else {
+                LOG_WARNING(Render_Vulkan, "Sparse layered image {:#x}: not every layer could be "
+                                           "bound, leaving it unbacked",
+                            gpu_addr_);
+                sparse_layers.Release();
+                sparse_layers.allocator = nullptr;
+                sparse_layers.bound_bytes = 0;
             }
         } else if (UsesSparseTiles(runtime_.device, info, gpu_addr_) && InitSparseTiles()) {
             flags |= VideoCommon::ImageFlagBits::SparseTiles;

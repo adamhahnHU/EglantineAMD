@@ -231,19 +231,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     // backed: VMA would quietly place them in system memory once VRAM is full. They take the
     // unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
-    bool huge = texels > (u64{1} << 28);
-    if (huge && !device.CanUseUnbackedSparseImages()) {
-        // AMD samples an image with nothing bound as black (title 1's 8192x8192x68 BC6H terrain,
-        // ~6 GB) and never backs it later: back it whenever it fits the card comfortably.
-        const auto& dld = device.GetDispatchLoader();
-        VkImage probe{};
-        if (dld.vkCreateImage(*device.GetLogical(), &ci, nullptr, &probe) == VK_SUCCESS) {
-            VkMemoryRequirements requirements{};
-            dld.vkGetImageMemoryRequirements(*device.GetLogical(), probe, &requirements);
-            dld.vkDestroyImage(*device.GetLogical(), probe, nullptr);
-            huge = requirements.size > device.GetDeviceLocalMemory() / 3;
-        }
-    }
+    const bool huge = texels > (u64{1} << 28);
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
