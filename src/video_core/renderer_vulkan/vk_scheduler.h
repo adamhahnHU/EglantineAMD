@@ -59,8 +59,7 @@ public:
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
-    /// submit deferred work (logged every 2 s while it waits). False only when the back thread
-    /// is not running, so nothing will submit it: the caller then submits it itself.
+    /// submit deferred work. False if that took over 2 s.
     bool WaitSubmitted(u64 tick);
     /// Whether everything up to tick has been handed to the worker for submission.
     [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
