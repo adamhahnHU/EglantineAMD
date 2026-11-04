@@ -767,15 +767,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         return;
     }
-    pipeline_cache_filename = base_dir / "vulkan.bin";
-    used_pipelines_filename = base_dir / "vulkan_used.bin";
+    // Files of their own: upstream builds use another cache version, and each deletes a cache
+    // file of a different version, so sharing one name lost the cache whenever a player switched.
+    pipeline_cache_filename = base_dir / "vulkan_mkwamd.bin";
+    used_pipelines_filename = base_dir / "vulkan_mkwamd_used.bin";
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
 
     if (use_vulkan_pipeline_cache) {
-        vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
+        vulkan_pipeline_cache_filename = base_dir / "vulkan_mkwamd_pipelines.bin";
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
     }
