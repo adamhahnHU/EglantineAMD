@@ -236,10 +236,22 @@ void TextureCache<P>::RunGarbageCollector() {
         }
     };
     Configure(false);
-    static const u64 old_age = [] {
+    static const u64 forced_old_age = [] {
         const char* value = std::getenv("EDEN_NX2_TC_OLD_AGE");
-        return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : ~0ULL;
     }();
+    // Cards of 16 GB and more keep decoded ASTC for two minutes at 30 fps: evicted after one,
+    // title 1's finish and results textures, last used at the start of a race, were decoded
+    // again as the race ended (hitches of 60-370 ms where a minute had 600-1,900 such evictions).
+    u64 old_age = 1800;
+    if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        if (runtime.GetDeviceLocalMemory() >= 16_GiB) {
+            old_age = 3600;
+        }
+    }
+    if (forced_old_age != ~0ULL) {
+        old_age = forced_old_age;
+    }
     if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
         evict_old_costly = true;
         lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
@@ -257,23 +269,24 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
     // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
     // MaxCriticalMemory on rather than near the card's budget.
-    // Cards of 16 GB and more keep all but 4 GiB: a Knockout Tour streams most of title 1's world,
-    // and capped at half of a 24 GB card it evicted thousands of decoded ASTC textures a minute.
+    // Cards of 16 GB and more keep all but 2 GiB: a Knockout Tour streams most of title 1's world,
+    // and capped at half of a 24 GB card it evicted thousands of decoded ASTC textures a minute;
+    // at the card minus 4 GiB a Grand Prix still evicted them with 8 GB of the budget unused.
     u64 max_critical = MaxCriticalMemory;
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
         const u64 device_local = runtime.GetDeviceLocalMemory();
         if (device_local >= 16_GiB) {
-            max_critical = (std::max)(max_critical, device_local - 4_GiB);
+            max_critical = (std::max)(max_critical, device_local - 2_GiB);
         }
     }
     critical_memory = (std::min)(critical_memory, max_critical);
     // Past expected the collector also evicts decoded ASTC unused for old_age frames (the world
     // behind the kart); past critical, any unused for 10 frames, which are decoded again at once.
-    // 768 MiB between them crossed that band in seconds on a Knockout Tour: keep 4 GiB on 16 GB+.
+    // 768 MiB between them crossed that band in seconds on a Knockout Tour: keep 2 GiB on 16 GB+.
     u64 band = 768_MiB;
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
         if (runtime.GetDeviceLocalMemory() >= 16_GiB) {
-            band = 4_GiB;
+            band = 2_GiB;
         }
     }
     expected_memory =
