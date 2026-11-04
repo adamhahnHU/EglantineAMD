@@ -750,11 +750,7 @@ VirtualDir NupContainer::GetExeFSDir(std::size_t package_index) {
         exefs_dir_cache.resize(packages.size());
     }
     if (exefs_dir_cache[package_index] == nullptr) {
-        auto dir = BuildPackageDir(packages[package_index].exefs_dir);
-        if (dir->GetFiles().empty() && dir->GetSubdirectories().empty()) {
-            return nullptr;
-        }
-        exefs_dir_cache[package_index] = std::move(dir);
+        exefs_dir_cache[package_index] = BuildPackageDir(packages[package_index].exefs_dir);
     }
     return exefs_dir_cache[package_index];
 }

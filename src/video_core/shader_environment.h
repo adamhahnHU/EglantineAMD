@@ -106,7 +106,7 @@ protected:
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
                                                               bool geometry = false);
     size_t native_source_size{};
-    /// Lower matrix multiplies too (KeplerCompute::EmulatesNativeTensorPrograms).
+    /// Lower matrix multiplies too (the passes of a game DLSS evaluation; LowerToMaxwell).
     bool native_tensor{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 

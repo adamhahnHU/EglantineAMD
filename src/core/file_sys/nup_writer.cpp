@@ -449,28 +449,7 @@ Layout BuildLayout(const Plan& plan) {
     for (auto& root : roots) {
         Layout::Package package;
         package.root_dir = AssignDir(root, layout);
-        layout.packages.push_back(package);
-    }
-
-    std::vector<u64> file_counts(layout.dirs.size(), 0);
-    for (std::size_t i = layout.dirs.size(); i-- > 0;) {
-        u64 total = 0;
-        const auto first = layout.dirs[i].first_child;
-        const auto count = layout.dirs[i].child_count;
-        for (u32 slot = first; slot < first + count; ++slot) {
-            const u64 child = layout.children[slot];
-            if (child & Layout::FileTag) {
-                total += 1;
-            } else {
-                total += file_counts[static_cast<std::size_t>(child)];
-            }
-        }
-        file_counts[i] = total;
-    }
-
-    for (std::size_t i = 0; i < layout.packages.size(); ++i) {
-        const auto& root_dir = layout.dirs[layout.packages[i].root_dir];
-        auto& package = layout.packages[i];
+        const auto& root_dir = layout.dirs[package.root_dir];
         for (u32 slot = root_dir.first_child; slot < root_dir.first_child + root_dir.child_count;
              ++slot) {
             const u64 child = layout.children[slot];
@@ -478,12 +457,13 @@ Layout BuildLayout(const Plan& plan) {
                 continue;
             }
             const auto id = static_cast<u32>(child);
-            if (layout.dirs[id].name == "exefs" && file_counts[id] > 0) {
+            if (layout.dirs[id].name == "exefs") {
                 package.exefs_dir = id;
-            } else if (layout.dirs[id].name == "romfs" && file_counts[id] > 0) {
+            } else if (layout.dirs[id].name == "romfs") {
                 package.romfs_dir = id;
             }
         }
+        layout.packages.push_back(package);
     }
 
     if (layout.dirs.size() + layout.files.size() >= NoDir) {
@@ -612,19 +592,7 @@ public:
 
 private:
     static bool HasContent(const fs::path& dir) {
-        return DirHasFiles(FindDirectory(dir, "exefs")) ||
-               DirHasFiles(FindDirectory(dir, "romfs"));
-    }
-
-    static bool DirHasFiles(const fs::path& dir) {
-        std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(dir, ec);
-             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            if (it->is_regular_file(ec)) {
-                return true;
-            }
-        }
-        return false;
+        return !FindDirectory(dir, "exefs").empty() || !FindDirectory(dir, "romfs").empty();
     }
 
     // Returns the package's title ID: the NPDM program ID, else the folder's or base's.
@@ -660,10 +628,10 @@ private:
         }
         plan.packages.push_back(std::move(package));
 
-        if (!exefs.empty() && DirHasFiles(exefs)) {
+        if (!exefs.empty()) {
             CollectTree(index, exefs, "exefs");
         }
-        if (!romfs.empty() && DirHasFiles(romfs)) {
+        if (!romfs.empty()) {
             CollectTree(index, romfs, "romfs");
         }
         std::error_code ec;
