@@ -103,9 +103,6 @@ public:
 
 void CancelPendingSocketOperations();
 void RestartSocketOperations();
-/// Whether socket operations are cancelled, as on emulation shutdown. Waits that no host socket
-/// operation wakes, such as deferred bsd requests, check this to end.
-bool SocketOperationsCancelled();
 
 #ifdef _WIN32
 constexpr IPv4Address TranslateIPv4(in_addr addr) {

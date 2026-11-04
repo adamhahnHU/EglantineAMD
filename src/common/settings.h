@@ -364,10 +364,6 @@ struct Values {
                                                     Specialization::Default,
                                                     true,
                                                     true};
-    // A Switch 2 game's own DLSS network (translated) in place of AMD FSR 3.1, where it runs and
-    // its output passes the checks.
-    SwitchableSetting<bool> game_dlss_network{linkage, true, "game_dlss_network",
-                                              Category::Renderer};
     SwitchableSetting<int, true> fsr_sharpening_slider{linkage,
 #ifdef __ANDROID__
                                                        0,
@@ -382,8 +378,6 @@ struct Values {
                                                            Specialization::Percentage,
                                                        true,
                                                        true};
-    // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
-    SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -607,9 +601,11 @@ struct Values {
     SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
                                                 Category::RendererAdvanced};
 
-    // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
+    // Mario Kart World: keep the game in its own 30 fps mode (loader/nso.cpp).
     SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
-    SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
+    // Mario Kart World: the game's own dynamic frame rate, timed on the whole frame (nso.cpp),
+    // with presents paced to every vblank (nx2_gsv.h). Takes precedence over mkw_30fps.
+    SwitchableSetting<bool> mkw_dynamic_fps{linkage, true, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
 
     SwitchableSetting<bool> use_reactive_flushing{linkage,
