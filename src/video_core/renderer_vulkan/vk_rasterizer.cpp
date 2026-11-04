@@ -235,7 +235,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
     VideoCommon::GpuSplit::Get().SetIdleHook(
-        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
+        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferredFence(); },
         &scheduler);
 }
 
@@ -1037,7 +1037,7 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }
 }
@@ -1288,11 +1288,7 @@ void RasterizerVulkan::FlushCommands() {
         return;
     }
     draw_counter = 0;
-    // Fences with downloads or queries come here right after queueing: ~9,400 a second in
-    // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
-    if (!scheduler.DeferFlush()) {
-        scheduler.Flush();
-    }
+    scheduler.Flush();
 }
 
 void RasterizerVulkan::TickFrame() {
