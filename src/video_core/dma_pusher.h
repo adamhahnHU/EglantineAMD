@@ -13,7 +13,6 @@
 #include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
-#include <deque>
 #include <queue>
 
 #include "common/bit_field.h"
@@ -153,13 +152,7 @@ public:
     ~DmaPusher();
 
     void Push(CommandList&& entries) {
-        // Copied during a suspension, or behind one: copy again now, unless still suspended.
-        const u64 now = suspensions.load(std::memory_order_acquire);
-        if (!entries.submitted_offsets.empty() && (now & 1) == 0 &&
-            entries.snapshot_suspensions != now) {
-            RefreshSnapshot(entries, now);
-        }
-        dma_pushbuffer.push_back(std::move(entries));
+        dma_pushbuffer.push(std::move(entries));
     }
 
     void DispatchCalls();
@@ -204,8 +197,6 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
-    /// Copies the list's words from memory again, as of suspension count `now`.
-    void RefreshSnapshot(CommandList& list, u64 now);
     /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
     /// buffer cache made after the work that wrote them or from guest memory for pages flushed
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
@@ -219,7 +210,7 @@ private:
 public:
     Common::ScratchBuffer<CommandHeader> command_headers; ///< Buffer for list of commands fetched at once
 
-    std::deque<CommandList> dma_pushbuffer; ///< Queue of command lists to be processed
+    std::queue<CommandList> dma_pushbuffer; ///< Queue of command lists to be processed
     std::size_t dma_pushbuffer_subindex{};  ///< Index within a command list within the pushbuffer
 
     struct DmaState {
