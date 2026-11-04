@@ -845,7 +845,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
-        if (!PreloadAllPipelines() &&
+        // Cards of 16 GB and more build every cached pipeline at boot, up to the 5,000 they keep
+        // (EvictUnusedPipelines): built when first needed, title 1's 172 left out of the recent
+        // sessions' list were translated on the GPU thread as a race ended (frames of 140-270 ms).
+        const bool preload_all =
+            PreloadAllPipelines() ||
+            (device.GetDeviceLocalMemory() >= (u64{16} << 30) && queued_graphics < 5000);
+        if (!preload_all &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
