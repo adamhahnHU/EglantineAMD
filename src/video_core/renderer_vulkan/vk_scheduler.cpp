@@ -408,6 +408,7 @@ void Scheduler::AllocateNewContext() {
 }
 
 void Scheduler::InvalidateState() {
+    ++recording_epoch;
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;
@@ -419,12 +420,14 @@ void Scheduler::EndPendingOperations() {
     EndRenderPass();
 }
 
+/// Finish the active render pass and invalidate recorded binds that do not survive it.
 void Scheduler::EndRenderPass()
     {
         RealizeDeferredClear();
         if (!state.renderpass) {
             return;
         }
+        ++recording_epoch;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 
