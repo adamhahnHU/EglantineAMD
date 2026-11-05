@@ -2431,8 +2431,8 @@ private:
     };
 
     static constexpr u32 NoSyncpoint = ~0U;
-    static constexpr size_t MaxQueuedInputs = 8;
-    static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
+    static constexpr size_t MaxQueuedInputs = 32;
+    static constexpr size_t MaxDecodedAhead = 4; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
 
     void Log(HLERequestContext& ctx, std::string_view what) {
@@ -2700,10 +2700,27 @@ private:
     // images, in order.
     void DecodeLoop() {
         Common::SetCurrentThreadName("nx2:vdec");
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
         std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder> decoder;
         std::vector<Tegra::Host1x::Nx2Picture> pictures;
         std::vector<u8> bytes;
+        // Movies play on a real-time clock. The client takes at most one frame per frame of its
+        // own: below the movie's rate (Mario Kart World's 30 FPS mode against its 60 fps pre-race
+        // movie) the movie ran in slow motion and its sound, read from the same stream, cut in
+        // and out. A frame whose successor is already due is dropped instead.
+        using Clock = std::chrono::steady_clock;
+        std::optional<std::pair<Clock::time_point, u64>> clock; // start time, start pts (us)
+        u64 dropped = 0;
+        const auto due_pts = [&] {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                Clock::now() - clock->first);
+            return clock->second + static_cast<u64>(elapsed.count());
+        };
+        // The newest decoded frame is already late, so decode further before filling an image.
+        const auto behind = [&] {
+            return clock && !m_inputs.empty() && m_decoded.size() < MaxDecodedAhead &&
+                   !m_decoded.empty() && !m_decoded.back().end &&
+                   m_decoded.back().pts + 8000 < due_pts();
+        };
         std::unique_lock lk{m_mutex};
         while (true) {
             m_cv.wait(lk, [&] {
@@ -2716,6 +2733,7 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
+                clock.reset();
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -2723,9 +2741,25 @@ private:
                 }
                 continue;
             }
-            if (!m_decoded.empty() && !m_free.empty()) {
+            if (!m_decoded.empty() && !m_free.empty() && !behind()) {
+                if (clock) {
+                    const u64 due = due_pts();
+                    while (m_decoded.size() > 1 && !m_decoded.front().end &&
+                           m_decoded[1].pts <= due && m_decoded[1].pts >= m_decoded.front().pts) {
+                        m_decoded.pop_front();
+                        if (++dropped == 1 || (dropped % 600) == 0) {
+                            LOG_INFO(Service, "{} dropped {} late frames", GetServiceName(),
+                                     dropped);
+                        }
+                    }
+                }
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
+                // Start the clock at the first frame, and again after a seek, a loop or a stall
+                // of over half a second (a pause), so those don't skip ahead.
+                if (!clock || frame.pts < clock->second || frame.pts + 500000 < due_pts()) {
+                    clock.emplace(Clock::now(), frame.pts);
+                }
                 const u32 image = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
